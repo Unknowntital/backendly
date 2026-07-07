@@ -5,20 +5,25 @@ import { Check, Copy, Terminal } from "lucide-react";
 import { CODE_SAMPLES } from "@/lib/data";
 
 const highlight = (code) => {
-    // very small syntax highlighter: keywords, strings, comments
-    const kw = /\b(import|from|const|let|await|async|function|package|return|var|new|if|else|for|def|print|main|err|struct)\b/g;
-    const str = /(&quot;[^&]*?&quot;|"[^"]*"|'[^']*')/g;
-    const num = /\b(\d+(\.\d+)?)\b/g;
-    const cmt = /(\/\/[^\n]*|#[^\n]*)/g;
+    // Escape HTML first
     let out = code
         .replaceAll("&", "&amp;")
         .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;");
-    out = out.replace(cmt, '<span class="text-zinc-500">$1</span>');
-    out = out.replace(str, '<span class="text-amber-300">$1</span>');
-    out = out.replace(kw, '<span class="text-teal-300">$1</span>');
-    out = out.replace(num, '<span class="text-amber-300">$1</span>');
+        .replaceAll(">", "&gt;");
+    // Placeholder tokens so later regexes don't re-match highlighted content
+    const store = [];
+    const stash = (html) => {
+        const i = store.length;
+        store.push(html);
+        return `\x00${i}\x00`;
+    };
+    // Order: comments → strings → keywords
+    out = out.replace(/(\/\/[^\n]*|#[^\n]*)/g, (m) => stash(`<span class="text-zinc-500">${m}</span>`));
+    out = out.replace(/("[^"\n]*"|'[^'\n]*')/g, (m) => stash(`<span class="text-amber-300">${m}</span>`));
+    out = out.replace(/\b(import|from|const|let|await|async|function|package|return|var|new|if|else|for|def|print|main|err|struct)\b/g,
+        (m) => stash(`<span class="text-teal-300">${m}</span>`));
+    // Restore placeholders
+    out = out.replace(/\x00(\d+)\x00/g, (_, i) => store[+i]);
     return out;
 };
 

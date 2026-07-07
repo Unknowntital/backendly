@@ -69,7 +69,7 @@ export default function Hero() {
                         </span>
                         <Sparkles className="w-3.5 h-3.5 text-amber-300" />
                         <span className="text-xs font-medium text-zinc-200">
-                            Now with AI-powered backend generation
+                            Database branching is now generally available
                         </span>
                     </div>
 

@@ -14,7 +14,7 @@ const COLS = [
         title: "Product",
         links: [
             { label: "Features", href: "/#features" },
-            { label: "AI Generation", href: "/#ai" },
+            { label: "Database", href: "/#features" },
             { label: "Pricing", href: "/#pricing" },
             { label: "Integrations", href: "/#integrations" },
             { label: "Changelog", href: "#" },

@@ -33,8 +33,8 @@ export default function Features() {
                         Everything your backend needs.
                     </h2>
                     <p className="mt-4 text-base md:text-lg text-zinc-400 leading-relaxed">
-                        One platform for auth, data, storage, APIs, functions, and realtime — plus an AI that scaffolds
-                        the boring parts so you can focus on the interesting bugs.
+                        One platform for auth, data, storage, APIs, functions, and realtime — the entire backend
+                        stack, without the ops. So you can focus on the interesting bugs.
                     </p>
                 </motion.div>
 

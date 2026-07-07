@@ -4,7 +4,6 @@ import Hero from "@/components/sections/Hero";
 import LogosStrip from "@/components/sections/LogosStrip";
 import Features from "@/components/sections/Features";
 import CodeExamples from "@/components/sections/CodeExamples";
-import AIShowcase from "@/components/sections/AIShowcase";
 import Integrations from "@/components/sections/Integrations";
 import DocsPreview from "@/components/sections/DocsPreview";
 import Pricing from "@/components/sections/Pricing";
@@ -29,7 +28,6 @@ export default function Home() {
             <LogosStrip />
             <Features />
             <CodeExamples />
-            <AIShowcase />
             <Integrations />
             <DocsPreview />
             <Pricing />

@@ -1,6 +1,6 @@
 import {
     Shield, Database, HardDrive, Cable, FunctionSquare, Radio,
-    Sparkles, LineChart, Package, Users, Rocket
+    LineChart, Package, Users, Rocket
 } from "lucide-react";
 
 export const NAV_LINKS = [
@@ -14,23 +14,21 @@ export const NAV_LINKS = [
 
 export const FEATURES = [
     {
-        key: "ai",
-        icon: Sparkles,
-        title: "AI Backend Generation",
-        blurb: "Describe your app in plain English. Backendly generates the schema, APIs, auth rules, and serverless functions — ready to deploy.",
-        bullets: ["Schema inference", "Auto-generated APIs", "Serverless functions", "Type-safe SDKs"],
+        key: "db",
+        icon: Database,
+        title: "Managed Postgres",
+        blurb: "Production-grade Postgres with instant REST + GraphQL APIs, branching, and point-in-time recovery — the database you'd pick anyway, without the ops.",
+        bullets: ["Instant APIs", "Database branching", "Row-level security", "PITR backups"],
         span: "md:col-span-2 md:row-span-2",
         featured: true,
     },
     { key: "auth", icon: Shield, title: "Authentication",
       blurb: "Social login, magic links, MFA, and battle-tested session management." },
-    { key: "db", icon: Database, title: "Database",
-      blurb: "Managed Postgres with instant REST + GraphQL APIs and branching." },
+    { key: "storage", icon: HardDrive, title: "File Storage",
+      blurb: "S3-compatible object storage with CDN and on-the-fly image transforms." },
     { key: "realtime", icon: Radio, title: "Realtime",
       blurb: "Websockets, presence, and live queries with sub-100ms latency.",
       span: "md:row-span-2" },
-    { key: "storage", icon: HardDrive, title: "File Storage",
-      blurb: "S3-compatible object storage with CDN and on-the-fly image transforms." },
     { key: "functions", icon: FunctionSquare, title: "Serverless Functions",
       blurb: "Deploy in seconds. Any runtime. Zero cold starts on hot paths." },
     { key: "api", icon: Cable, title: "REST & GraphQL",
@@ -132,7 +130,7 @@ export const PRICING_FEATURES = [
     "REST & GraphQL APIs, auto-generated",
     "Serverless functions in any runtime",
     "Realtime websockets & live queries",
-    "AI-powered backend generation",
+    "Point-in-time backups & recovery",
     "Analytics, monitoring & alerts",
     "SDKs for JS, Python, Go, Swift, Kotlin",
     "Team roles, permissions, environments",
@@ -164,8 +162,8 @@ export const BLOG_POSTS = [
     },
     {
         category: "Product",
-        title: "Introducing AI Backend Generation",
-        excerpt: "Describe your app. Get a schema, APIs, auth rules, and a functions scaffold you can actually ship.",
+        title: "Database branching is now GA",
+        excerpt: "Instant, copy-on-write branches of your Postgres — perfect for preview deployments, schema migrations, and safe experiments.",
         date: "Dec 4, 2025",
         readTime: "5 min read",
     },
@@ -191,8 +189,6 @@ export const FAQS = [
       a: "SOC 2 Type II, GDPR, and HIPAA-ready configurations. All data is encrypted at rest (AES-256) and in transit (TLS 1.3). Row-level security is on by default." },
     { q: "What's the uptime SLA?",
       a: "99.99% on the managed platform, with a public status page and postmortems on every incident." },
-    { q: "Are there limits on the AI features?",
-      a: "Generous free-tier generation credits reset monthly. Heavy users can request an increase — we don't want price to be the reason you don't ship." },
     { q: "How do I get support?",
       a: "Community support in Discord, GitHub issues for bugs, and a direct line to engineering for teams on dedicated infrastructure." },
 ];
