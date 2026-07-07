@@ -1056,8 +1056,201 @@ async def api_v1_delete_record(
     return {"ok": True}
 
 
-app.include_router(api_router)
+# ==================================================================
+# Auth-as-a-Service: end-user auth scoped by project
+# ==================================================================
+END_USER_SESSION_DAYS = 30
+auth_v1 = APIRouter(prefix="/api/v1/auth")
+
+
+class EndUserSignup(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=6, max_length=128)
+    name: Optional[str] = Field(default=None, max_length=80)
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class EndUserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class EndUserPublic(BaseModel):
+    id: str
+    email: str
+    name: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    created_at: datetime
+
+
+class EndUserAuthResponse(BaseModel):
+    user: EndUserPublic
+    token: str
+    expires_at: datetime
+
+
+async def _end_user_token_project(request: Request,
+                                  x_api_key: Optional[str] = Header(default=None),
+                                  authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    """Requires BOTH X-API-Key (project scope) AND Bearer token (end user)."""
+    project_id = await api_key_project(request, x_api_key=x_api_key, authorization=None)
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization: Bearer <user_token>.")
+    token = authorization.split(" ", 1)[1].strip()
+    sess = await db.end_user_sessions.find_one({"token": token, "project_id": project_id}, {"_id": 0})
+    if not sess:
+        raise HTTPException(status_code=401, detail="Invalid or expired user token.")
+    expires_at = sess["expires_at"]
+    if isinstance(expires_at, str):
+        expires_at = datetime.fromisoformat(expires_at)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="Session expired. Please sign in again.")
+    end_user = await db.end_users.find_one({"project_id": project_id, "end_user_id": sess["end_user_id"]},
+                                           {"_id": 0, "password_hash": 0})
+    if not end_user:
+        raise HTTPException(status_code=401, detail="User no longer exists.")
+    return {"project_id": project_id, "end_user": end_user, "token": token}
+
+
+def _end_user_envelope(doc: Dict[str, Any]) -> EndUserPublic:
+    created = doc.get("created_at")
+    if isinstance(created, str):
+        created = datetime.fromisoformat(created)
+    return EndUserPublic(
+        id=doc["end_user_id"],
+        email=doc["email"],
+        name=doc.get("name"),
+        metadata=doc.get("metadata"),
+        created_at=created or datetime.now(timezone.utc),
+    )
+
+
+async def _create_end_user_session(project_id: str, end_user_id: str) -> tuple[str, datetime]:
+    token = secrets.token_urlsafe(40)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=END_USER_SESSION_DAYS)
+    await db.end_user_sessions.insert_one({
+        "token": token,
+        "project_id": project_id,
+        "end_user_id": end_user_id,
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return token, expires_at
+
+
+@auth_v1.post("/signup", response_model=EndUserAuthResponse, status_code=201)
+async def end_user_signup(payload: EndUserSignup, project_id: str = Depends(api_key_project)):
+    existing = await db.end_users.find_one({"project_id": project_id, "email": payload.email})
+    if existing:
+        raise HTTPException(status_code=409, detail="An account with this email already exists.")
+    end_user_id = f"eu_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "end_user_id": end_user_id,
+        "project_id": project_id,
+        "email": payload.email,
+        "name": payload.name or payload.email.split("@")[0],
+        "password_hash": bcrypt.hashpw(payload.password.encode(), bcrypt.gensalt()).decode(),
+        "metadata": payload.metadata or {},
+        "email_verified": False,
+        "created_at": now,
+    }
+    await db.end_users.insert_one(doc)
+    token, expires_at = await _create_end_user_session(project_id, end_user_id)
+    return EndUserAuthResponse(user=_end_user_envelope(doc), token=token, expires_at=expires_at)
+
+
+@auth_v1.post("/login", response_model=EndUserAuthResponse)
+async def end_user_login(payload: EndUserLogin, project_id: str = Depends(api_key_project)):
+    doc = await db.end_users.find_one({"project_id": project_id, "email": payload.email}, {"_id": 0})
+    if not doc or not bcrypt.checkpw(payload.password.encode(), doc["password_hash"].encode()):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    token, expires_at = await _create_end_user_session(project_id, doc["end_user_id"])
+    return EndUserAuthResponse(user=_end_user_envelope(doc), token=token, expires_at=expires_at)
+
+
+@auth_v1.get("/me", response_model=EndUserPublic)
+async def end_user_me(ctx: Dict[str, Any] = Depends(_end_user_token_project)):
+    return _end_user_envelope(ctx["end_user"])
+
+
+@auth_v1.post("/logout")
+async def end_user_logout(ctx: Dict[str, Any] = Depends(_end_user_token_project)):
+    await db.end_user_sessions.delete_one({"token": ctx["token"]})
+    return {"ok": True}
+
+
+app.include_router(auth_v1)
 app.include_router(api_v1)
+
+@api_router.get("/projects/{project_id}/end-users", response_model=List[EndUserPublic])
+async def list_end_users(project_id: str, user: User = Depends(current_user)):
+    await _owned_project(project_id, user)
+    docs = await db.end_users.find({"project_id": project_id},
+                                    {"_id": 0, "password_hash": 0}).sort("created_at", -1).to_list(500)
+    return [_end_user_envelope(d) for d in docs]
+
+
+@api_router.delete("/projects/{project_id}/end-users/{end_user_id}")
+async def delete_end_user(project_id: str, end_user_id: str, user: User = Depends(current_user)):
+    await _owned_project(project_id, user)
+    res = await db.end_users.delete_one({"project_id": project_id, "end_user_id": end_user_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="User not found.")
+    await db.end_user_sessions.delete_many({"project_id": project_id, "end_user_id": end_user_id})
+    return {"ok": True}
+
+
+# ---------------- Table templates for beginners ----------------
+TABLE_TEMPLATES = {
+    "users": {
+        "name": "users",
+        "description": "Basic user profile table — name, email, bio.",
+        "fields": [
+            {"name": "email", "type": "string", "required": True},
+            {"name": "name", "type": "string", "required": True},
+            {"name": "bio", "type": "string"},
+            {"name": "avatar_url", "type": "string"},
+        ],
+    },
+    "posts": {
+        "name": "posts",
+        "description": "Blog posts or a social feed.",
+        "fields": [
+            {"name": "author", "type": "string", "required": True},
+            {"name": "title", "type": "string", "required": True},
+            {"name": "body", "type": "string", "required": True},
+            {"name": "published", "type": "boolean", "default": False},
+            {"name": "tags", "type": "json"},
+        ],
+    },
+    "orders": {
+        "name": "orders",
+        "description": "E-commerce orders with items and totals.",
+        "fields": [
+            {"name": "customer_email", "type": "string", "required": True},
+            {"name": "total_cents", "type": "integer", "required": True},
+            {"name": "status", "type": "string", "default": "pending"},
+            {"name": "items", "type": "json"},
+        ],
+    },
+    "todos": {
+        "name": "todos",
+        "description": "Classic to-do items — task, done flag, due date.",
+        "fields": [
+            {"name": "task", "type": "string", "required": True},
+            {"name": "done", "type": "boolean", "default": False},
+            {"name": "due_at", "type": "datetime"},
+        ],
+    },
+}
+
+
+@api_router.get("/table-templates")
+async def list_table_templates(user: User = Depends(current_user)):
+    return list(TABLE_TEMPLATES.values())
 
 
 @app.middleware("http")
@@ -1111,6 +1304,9 @@ async def create_indexes():
         await db.request_logs.create_index([("project_id", 1), ("created_at", -1)])
         # Auto-expire request logs after 40 days
         await db.request_logs.create_index("created_at", expireAfterSeconds=60 * 60 * 24 * 40)
+        await db.end_users.create_index([("project_id", 1), ("email", 1)], unique=True)
+        await db.end_user_sessions.create_index("token", unique=True)
+        await db.end_user_sessions.create_index([("project_id", 1), ("end_user_id", 1)])
     except Exception as e:
         logger.error(f"Index creation error: {e}")
 
