@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { Link, useLocation } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { Menu, X, ArrowRight } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useAuth } from "@/contexts/AuthContext";
 
 const LINKS = [
     { label: "Product", href: "/#features" },
@@ -30,6 +31,8 @@ export default function Navbar() {
     const [scrolled, setScrolled] = useState(false);
     const [open, setOpen] = useState(false);
     const location = useLocation();
+    const navigate = useNavigate();
+    const { user, logout } = useAuth();
 
     useEffect(() => {
         const onScroll = () => setScrolled(window.scrollY > 12);
@@ -83,13 +86,30 @@ export default function Navbar() {
                         ))}
                     </ul>
                     <div className="hidden lg:flex items-center gap-3">
-                        <button className="text-sm font-medium text-zinc-300 hover:text-white px-4 py-2 transition-colors" data-testid="nav-signin">
-                            Sign in
-                        </button>
-                        <a href="#pricing" className="btn-primary" data-testid="nav-cta-start">
-                            Start Building Free
-                            <ArrowRight className="w-4 h-4" />
-                        </a>
+                        {user ? (
+                            <>
+                                <button
+                                    onClick={async () => { await logout(); navigate("/"); }}
+                                    className="text-sm font-medium text-zinc-300 hover:text-white px-4 py-2 transition-colors"
+                                    data-testid="nav-signout"
+                                >
+                                    Sign out
+                                </button>
+                                <Link to="/dashboard" className="btn-primary" data-testid="nav-dashboard">
+                                    Dashboard <ArrowRight className="w-4 h-4" />
+                                </Link>
+                            </>
+                        ) : (
+                            <>
+                                <Link to="/login" className="text-sm font-medium text-zinc-300 hover:text-white px-4 py-2 transition-colors" data-testid="nav-signin">
+                                    Sign in
+                                </Link>
+                                <Link to="/signup" className="btn-primary" data-testid="nav-cta-start">
+                                    Start Building Free
+                                    <ArrowRight className="w-4 h-4" />
+                                </Link>
+                            </>
+                        )}
                     </div>
                     <button
                         className="lg:hidden h-10 w-10 rounded-lg glass flex items-center justify-center text-white"
@@ -149,10 +169,21 @@ export default function Navbar() {
                         ))}
                     </ul>
                     <div className="container-x py-8 flex flex-col gap-3">
-                        <button className="btn-ghost w-full">Sign in</button>
-                        <a href="#pricing" className="btn-primary w-full" onClick={() => setOpen(false)}>
-                            Start Building Free <ArrowRight className="w-4 h-4" />
-                        </a>
+                        {user ? (
+                            <>
+                                <button onClick={async () => { await logout(); navigate("/"); setOpen(false); }} className="btn-ghost w-full">Sign out</button>
+                                <Link to="/dashboard" className="btn-primary w-full" onClick={() => setOpen(false)}>
+                                    Dashboard <ArrowRight className="w-4 h-4" />
+                                </Link>
+                            </>
+                        ) : (
+                            <>
+                                <Link to="/login" className="btn-ghost w-full" onClick={() => setOpen(false)}>Sign in</Link>
+                                <Link to="/signup" className="btn-primary w-full" onClick={() => setOpen(false)}>
+                                    Start Building Free <ArrowRight className="w-4 h-4" />
+                                </Link>
+                            </>
+                        )}
                     </div>
                 </div>
             </div>

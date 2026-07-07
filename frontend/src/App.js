@@ -1,21 +1,49 @@
 import "@/App.css";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, Routes, Route, useLocation } from "react-router-dom";
 import { Toaster } from "@/components/ui/sonner";
+import { AuthProvider } from "@/contexts/AuthContext";
 import Home from "@/pages/Home";
 import About from "@/pages/About";
 import Contact from "@/pages/Contact";
 import Docs from "@/pages/Docs";
+import AuthPage from "@/pages/AuthPage";
+import AuthCallback from "@/pages/AuthCallback";
+import Dashboard from "@/pages/Dashboard";
+import ProtectedRoute from "@/components/ProtectedRoute";
+
+function AppRouter() {
+    const location = useLocation();
+    // Detect session_id in URL fragment synchronously (must run BEFORE other routes)
+    if (location.hash?.includes("session_id=")) {
+        return <AuthCallback />;
+    }
+    return (
+        <Routes>
+            <Route path="/" element={<Home />} />
+            <Route path="/about" element={<About />} />
+            <Route path="/contact" element={<Contact />} />
+            <Route path="/docs" element={<Docs />} />
+            <Route path="/login" element={<AuthPage mode="login" />} />
+            <Route path="/signup" element={<AuthPage mode="signup" />} />
+            <Route
+                path="/dashboard"
+                element={
+                    <ProtectedRoute>
+                        <Dashboard />
+                    </ProtectedRoute>
+                }
+            />
+        </Routes>
+    );
+}
 
 function App() {
     return (
         <div className="App min-h-screen bg-[#08090C] text-white antialiased">
             <BrowserRouter>
-                <Routes>
-                    <Route path="/" element={<Home />} />
-                    <Route path="/about" element={<About />} />
-                    <Route path="/contact" element={<Contact />} />
-                    <Route path="/docs" element={<Docs />} />
-                </Routes>
+                <AuthProvider>
+                    <AppRouter />
+                </AuthProvider>
             </BrowserRouter>
             <Toaster
                 theme="dark"

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, Cookie, Header
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -8,7 +8,10 @@ from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict, EmailStr
 from typing import List, Optional
 import uuid
-from datetime import datetime, timezone
+import bcrypt
+import httpx
+import secrets
+from datetime import datetime, timezone, timedelta
 
 
 ROOT_DIR = Path(__file__).parent
@@ -20,6 +23,9 @@ db = client[os.environ['DB_NAME']]
 
 app = FastAPI(title="Backendly API")
 api_router = APIRouter(prefix="/api")
+
+SESSION_DAYS = 7
+COOKIE_NAME = "session_token"
 
 
 # ---------------- Models ----------------
@@ -64,7 +70,104 @@ class NewsletterSubscriber(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-# ---------------- Routes ----------------
+class User(BaseModel):
+    user_id: str
+    email: str
+    name: str
+    picture: Optional[str] = None
+    auth_provider: str
+
+
+class RegisterPayload(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+    name: str = Field(min_length=1, max_length=80)
+
+
+class LoginPayload(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class GoogleSessionPayload(BaseModel):
+    session_id: str
+
+
+class ProjectCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    region: Optional[str] = Field(default="us-east-1", max_length=32)
+
+
+class Project(BaseModel):
+    project_id: str
+    user_id: str
+    name: str
+    region: str
+    created_at: datetime
+
+
+# ---------------- Auth helpers ----------------
+def _mint_session_token() -> str:
+    return secrets.token_urlsafe(48)
+
+
+async def _create_session(user_id: str) -> str:
+    token = _mint_session_token()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
+    await db.user_sessions.insert_one({
+        "user_id": user_id,
+        "session_token": token,
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return token
+
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        max_age=SESSION_DAYS * 24 * 3600,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/",
+    )
+
+
+async def _get_user_from_token(token: str) -> Optional[User]:
+    sess = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
+    if not sess:
+        return None
+    expires_at = sess["expires_at"]
+    if isinstance(expires_at, str):
+        expires_at = datetime.fromisoformat(expires_at)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at < datetime.now(timezone.utc):
+        return None
+    user_doc = await db.users.find_one({"user_id": sess["user_id"]}, {"_id": 0, "password_hash": 0})
+    if not user_doc:
+        return None
+    return User(**user_doc)
+
+
+async def current_user(
+    session_token: Optional[str] = Cookie(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> User:
+    token = session_token
+    if not token and authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    user = await _get_user_from_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Session expired or invalid")
+    return user
+
+
+# ---------------- Health / legacy ----------------
 @api_router.get("/")
 async def root():
     return {"service": "Backendly API", "status": "ok"}
@@ -88,6 +191,7 @@ async def get_status_checks():
     return status_checks
 
 
+# ---------------- Contact / Newsletter ----------------
 @api_router.post("/contact", response_model=ContactMessage, status_code=201)
 async def create_contact_message(payload: ContactMessageCreate):
     msg = ContactMessage(**payload.model_dump())
@@ -116,6 +220,139 @@ async def subscribe_newsletter(payload: NewsletterCreate):
     doc['created_at'] = doc['created_at'].isoformat()
     await db.newsletter_subscribers.insert_one(doc)
     return sub
+
+
+# ---------------- Auth: email + password ----------------
+@api_router.post("/auth/register", response_model=User, status_code=201)
+async def register(payload: RegisterPayload, response: Response):
+    existing = await db.users.find_one({"email": payload.email})
+    if existing:
+        raise HTTPException(status_code=409, detail="An account with this email already exists.")
+    user_id = f"user_{uuid.uuid4().hex[:12]}"
+    pw_hash = bcrypt.hashpw(payload.password.encode(), bcrypt.gensalt()).decode()
+    now = datetime.now(timezone.utc).isoformat()
+    await db.users.insert_one({
+        "user_id": user_id,
+        "email": payload.email,
+        "name": payload.name,
+        "picture": None,
+        "auth_provider": "password",
+        "password_hash": pw_hash,
+        "created_at": now,
+    })
+    token = await _create_session(user_id)
+    _set_session_cookie(response, token)
+    return User(user_id=user_id, email=payload.email, name=payload.name, picture=None, auth_provider="password")
+
+
+@api_router.post("/auth/login", response_model=User)
+async def login(payload: LoginPayload, response: Response):
+    doc = await db.users.find_one({"email": payload.email}, {"_id": 0})
+    if not doc or not doc.get("password_hash"):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    if not bcrypt.checkpw(payload.password.encode(), doc["password_hash"].encode()):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    token = await _create_session(doc["user_id"])
+    _set_session_cookie(response, token)
+    return User(
+        user_id=doc["user_id"],
+        email=doc["email"],
+        name=doc["name"],
+        picture=doc.get("picture"),
+        auth_provider=doc.get("auth_provider", "password"),
+    )
+
+
+# ---------------- Auth: Emergent Google ----------------
+# REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
+@api_router.post("/auth/session", response_model=User)
+async def emergent_session(payload: GoogleSessionPayload, response: Response):
+    async with httpx.AsyncClient(timeout=15) as http:
+        r = await http.get(
+            "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
+            headers={"X-Session-ID": payload.session_id},
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid Google session.")
+    data = r.json()
+    email = data["email"]
+    name = data.get("name") or email.split("@")[0]
+    picture = data.get("picture")
+    session_token = data["session_token"]
+
+    existing = await db.users.find_one({"email": email}, {"_id": 0})
+    if existing:
+        user_id = existing["user_id"]
+        await db.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"name": name, "picture": picture}},
+        )
+    else:
+        user_id = f"user_{uuid.uuid4().hex[:12]}"
+        await db.users.insert_one({
+            "user_id": user_id,
+            "email": email,
+            "name": name,
+            "picture": picture,
+            "auth_provider": "google",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)).isoformat()
+    await db.user_sessions.insert_one({
+        "user_id": user_id,
+        "session_token": session_token,
+        "expires_at": expires_at,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    _set_session_cookie(response, session_token)
+    return User(user_id=user_id, email=email, name=name, picture=picture, auth_provider="google")
+
+
+@api_router.get("/auth/me", response_model=User)
+async def me(user: User = Depends(current_user)):
+    return user
+
+
+@api_router.post("/auth/logout")
+async def logout(response: Response, session_token: Optional[str] = Cookie(default=None)):
+    if session_token:
+        await db.user_sessions.delete_one({"session_token": session_token})
+    response.delete_cookie(COOKIE_NAME, path="/", samesite="none", secure=True)
+    return {"ok": True}
+
+
+# ---------------- Projects (dashboard) ----------------
+@api_router.get("/projects", response_model=List[Project])
+async def list_projects(user: User = Depends(current_user)):
+    docs = await db.projects.find({"user_id": user.user_id}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    for d in docs:
+        if isinstance(d.get("created_at"), str):
+            d["created_at"] = datetime.fromisoformat(d["created_at"])
+    return docs
+
+
+@api_router.post("/projects", response_model=Project, status_code=201)
+async def create_project(payload: ProjectCreate, user: User = Depends(current_user)):
+    project_id = f"prj_{uuid.uuid4().hex[:10]}"
+    now = datetime.now(timezone.utc)
+    doc = {
+        "project_id": project_id,
+        "user_id": user.user_id,
+        "name": payload.name,
+        "region": payload.region or "us-east-1",
+        "created_at": now.isoformat(),
+    }
+    await db.projects.insert_one(doc)
+    return Project(project_id=project_id, user_id=user.user_id, name=payload.name, region=doc["region"], created_at=now)
+
+
+@api_router.delete("/projects/{project_id}")
+async def delete_project(project_id: str, user: User = Depends(current_user)):
+    res = await db.projects.delete_one({"project_id": project_id, "user_id": user.user_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    return {"ok": True}
 
 
 app.include_router(api_router)

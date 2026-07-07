@@ -90,10 +90,10 @@ export default function Hero() {
                     </p>
 
                     <div className="mt-8 flex flex-col sm:flex-row gap-3">
-                        <a href="#pricing" className="btn-primary group" data-testid="hero-cta-primary">
+                        <Link to="/signup" className="btn-primary group" data-testid="hero-cta-primary">
                             Start Building Free
                             <ArrowRight className="w-4 h-4 transition-transform group-hover:translate-x-0.5" />
-                        </a>
+                        </Link>
                         <Link to="/docs" className="btn-ghost" data-testid="hero-cta-secondary">
                             View Documentation
                         </Link>

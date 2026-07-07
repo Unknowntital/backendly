@@ -60,10 +60,10 @@ export default function Pricing() {
                             </ul>
 
                             <div className="mt-10 flex justify-center">
-                                <a href="#" className="btn-primary group" data-testid="pricing-cta">
+                                <Link to="/signup" className="btn-primary group" data-testid="pricing-cta">
                                     Start Building Free
                                     <ArrowRight className="w-4 h-4 transition-transform group-hover:translate-x-0.5" />
-                                </a>
+                                </Link>
                             </div>
                         </div>
                     </div>

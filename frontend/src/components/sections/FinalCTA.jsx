@@ -1,4 +1,5 @@
 import { motion } from "framer-motion";
+import { Link } from "react-router-dom";
 import { ArrowRight } from "lucide-react";
 
 export default function FinalCTA() {
@@ -25,11 +26,11 @@ export default function FinalCTA() {
                             Sign up, run one command, and watch a production-ready backend appear.
                         </p>
                         <div className="mt-8 flex flex-col sm:flex-row gap-3 justify-center">
-                            <a href="#pricing" className="btn-primary group" data-testid="final-cta-primary">
+                            <Link to="/signup" className="btn-primary group" data-testid="final-cta-primary">
                                 Start Building Free
                                 <ArrowRight className="w-4 h-4 transition-transform group-hover:translate-x-0.5" />
-                            </a>
-                            <a href="#docs" className="btn-ghost">Read the docs</a>
+                            </Link>
+                            <Link to="/docs" className="btn-ghost">Read the docs</Link>
                         </div>
                         <p className="mt-4 text-xs text-zinc-500">No credit card required · Free tier forever</p>
                     </div>
