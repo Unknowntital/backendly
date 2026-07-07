@@ -1,0 +1,52 @@
+{
+  "summary": "Backend endpoints all pass (6/6). Frontend has a blocking webpack compile error from a missing icon export (SiLinkedin) in Footer.jsx, which renders a webpack-dev-server-client-overlay iframe that intercepts pointer events. This blocks FAQ accordion clicks and newsletter submit button. Home hero CTA, feature-ai card, code tabs+copy, pricing features, about stats, docs page all render/work. Contact form submit test failed because test used page.fill on a <select> — needs select_option (test-side, not app bug), but the underlying overlay likely also blocks the submit button.",
+  "tested_scope": ["frontend", "backend", "integration"],
+  "passed": [
+    "GET /api/ -> 200 {service: Backendly API, status: ok}",
+    "POST /api/contact valid -> 201 with id",
+    "POST /api/contact invalid email -> 422",
+    "GET /api/contact -> 200 list",
+    "POST /api/newsletter -> 201 with id",
+    "POST /api/newsletter duplicate -> 409",
+    "Home page loads; hero-cta-primary visible",
+    "feature-card-ai visible",
+    "code-tab-javascript / code-tab-python switch; code-copy-btn clickable",
+    "pricing-features visible",
+    "/about renders with stats-strip",
+    "/docs page loads"
+  ],
+  "failed": [
+    {
+      "area": "frontend/build",
+      "issue": "Webpack compile error: 'SiLinkedin' is not exported from 'react-icons/si' (imported in src/components/layout/Footer.jsx line 312). Correct name is 'SiLinkedin' export doesn't exist in this react-icons version — likely should be 'FaLinkedin' (react-icons/fa) or 'SiLinkedin' from a different subpackage. Error renders webpack-dev-server-client-overlay <iframe> that intercepts pointer events across the page.",
+      "evidence": "supervisor frontend.out.log: \"Attempted import error: 'SiLinkedin' is not exported from 'react-icons/si' ... ERROR in ./src/components/layout/Footer.jsx 312:20-30\". Playwright click retries fail with '<iframe src=\"about:blank\" id=\"webpack-dev-server-client-overlay\"> intercepts pointer events' on faq-trigger-0 and newsletter-submit.",
+      "priority": "HIGH"
+    },
+    {
+      "area": "frontend/faq",
+      "issue": "faq-trigger-0 click blocked by webpack overlay iframe (downstream of the SiLinkedin error).",
+      "evidence": "Playwright log shows repeated retries with overlay interception on data-testid=faq-trigger-0.",
+      "priority": "HIGH"
+    },
+    {
+      "area": "frontend/newsletter",
+      "issue": "newsletter-submit click blocked by webpack overlay iframe; Subscribed state never appears.",
+      "evidence": "Same overlay interception on data-testid=newsletter-submit.",
+      "priority": "HIGH"
+    },
+    {
+      "area": "frontend/hero",
+      "issue": "Exact string 'Ship your backend before your coffee gets cold.' not matched by a single-node text selector — headline may be split across multiple spans/elements. CTA still visible so likely a text-split, not a missing headline. Verify visually.",
+      "evidence": "page.locator(text=...).is_visible() returned False while hero-cta-primary is True.",
+      "priority": "LOW"
+    }
+  ],
+  "action_items": [
+    "Fix Footer.jsx import: replace SiLinkedin (from react-icons/si) with a valid export, e.g. FaLinkedin/FaLinkedinIn from react-icons/fa, or use the correct simple-icons name. This will remove the webpack overlay and unblock FAQ + newsletter interactions.",
+    "After fix, retest FAQ accordion expand, newsletter submit (expect Subscribed state), and contact form submit end-to-end (note: contact-subject is a <select>, so submit flow should be re-verified once overlay is gone).",
+    "Confirm hero headline is rendered as a single readable string (or accept split rendering)."
+  ],
+  "success_rate": {"backend": "100%", "frontend": "~70%"},
+  "retest_needed": true,
+  "full_testing_deferred": true
+}
