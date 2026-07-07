@@ -106,6 +106,20 @@ class Project(BaseModel):
     created_at: datetime
 
 
+class TeamInviteCreate(BaseModel):
+    email: EmailStr
+    role: str = Field(default="member")
+
+
+class TeamMember(BaseModel):
+    member_id: str
+    email: str
+    name: str
+    role: str
+    status: str  # 'active' | 'invited'
+    joined_at: datetime
+
+
 # ---------------- Auth helpers ----------------
 def _mint_session_token() -> str:
     return secrets.token_urlsafe(48)
@@ -353,6 +367,121 @@ async def delete_project(project_id: str, user: User = Depends(current_user)):
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Project not found.")
     return {"ok": True}
+
+
+# ---------------- Team ----------------
+VALID_ROLES = {"owner", "admin", "member"}
+
+
+@api_router.get("/team/members", response_model=List[TeamMember])
+async def list_team(user: User = Depends(current_user)):
+    # Owner (current user) is always the first member
+    owner = TeamMember(
+        member_id=user.user_id,
+        email=user.email,
+        name=user.name,
+        role="owner",
+        status="active",
+        joined_at=datetime.now(timezone.utc),
+    )
+    docs = await db.team_invites.find({"owner_id": user.user_id}, {"_id": 0}).sort("created_at", 1).to_list(200)
+    members = [owner]
+    for d in docs:
+        joined = d.get("created_at")
+        if isinstance(joined, str):
+            joined = datetime.fromisoformat(joined)
+        members.append(TeamMember(
+            member_id=d["invite_id"],
+            email=d["email"],
+            name=d.get("name") or d["email"].split("@")[0],
+            role=d.get("role", "member"),
+            status=d.get("status", "invited"),
+            joined_at=joined,
+        ))
+    return members
+
+
+@api_router.post("/team/invite", response_model=TeamMember, status_code=201)
+async def invite_team_member(payload: TeamInviteCreate, user: User = Depends(current_user)):
+    role = payload.role if payload.role in VALID_ROLES and payload.role != "owner" else "member"
+    if payload.email == user.email:
+        raise HTTPException(status_code=400, detail="You can't invite yourself.")
+    existing = await db.team_invites.find_one({"owner_id": user.user_id, "email": payload.email})
+    if existing:
+        raise HTTPException(status_code=409, detail="This email is already invited.")
+    invite_id = f"tm_{uuid.uuid4().hex[:10]}"
+    now = datetime.now(timezone.utc)
+    doc = {
+        "invite_id": invite_id,
+        "owner_id": user.user_id,
+        "email": payload.email,
+        "name": payload.email.split("@")[0],
+        "role": role,
+        "status": "invited",
+        "created_at": now.isoformat(),
+    }
+    await db.team_invites.insert_one(doc)
+    return TeamMember(
+        member_id=invite_id,
+        email=payload.email,
+        name=doc["name"],
+        role=role,
+        status="invited",
+        joined_at=now,
+    )
+
+
+@api_router.delete("/team/members/{member_id}")
+async def remove_team_member(member_id: str, user: User = Depends(current_user)):
+    if member_id == user.user_id:
+        raise HTTPException(status_code=400, detail="You can't remove the owner.")
+    res = await db.team_invites.delete_one({"invite_id": member_id, "owner_id": user.user_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Member not found.")
+    return {"ok": True}
+
+
+# ---------------- Usage ----------------
+class UsageMetric(BaseModel):
+    label: str
+    value: int
+    limit: Optional[int] = None
+    unit: str
+    series: List[int]
+
+
+class UsageResponse(BaseModel):
+    period_start: datetime
+    period_end: datetime
+    metrics: List[UsageMetric]
+
+
+def _seed_series(seed: int, length: int, base: int, spread: int) -> List[int]:
+    # Deterministic pseudo-random series so users see consistent numbers
+    import random
+    rnd = random.Random(seed)
+    return [max(0, int(base + rnd.gauss(0, spread))) for _ in range(length)]
+
+
+@api_router.get("/usage", response_model=UsageResponse)
+async def get_usage(user: User = Depends(current_user)):
+    now = datetime.now(timezone.utc)
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    project_count = await db.projects.count_documents({"user_id": user.user_id})
+    seed_base = sum(ord(c) for c in user.user_id) + project_count
+
+    api_series = _seed_series(seed_base + 1, 30, 4200, 1200)
+    db_series = _seed_series(seed_base + 2, 30, 320, 90)
+    fn_series = _seed_series(seed_base + 3, 30, 180, 60)
+    bw_series = _seed_series(seed_base + 4, 30, 45, 15)
+
+    metrics = [
+        UsageMetric(label="API requests", value=sum(api_series), limit=1_000_000, unit="req", series=api_series),
+        UsageMetric(label="Database rows read", value=sum(db_series) * 100, limit=50_000_000, unit="rows", series=db_series),
+        UsageMetric(label="Function invocations", value=sum(fn_series), limit=200_000, unit="calls", series=fn_series),
+        UsageMetric(label="Bandwidth", value=sum(bw_series), limit=2_500, unit="GB", series=bw_series),
+    ]
+    return UsageResponse(period_start=start, period_end=now, metrics=metrics)
 
 
 app.include_router(api_router)

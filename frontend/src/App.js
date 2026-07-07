@@ -9,6 +9,9 @@ import Docs from "@/pages/Docs";
 import AuthPage from "@/pages/AuthPage";
 import AuthCallback from "@/pages/AuthCallback";
 import Dashboard from "@/pages/Dashboard";
+import ProjectsView from "@/pages/dashboard/ProjectsView";
+import TeamView from "@/pages/dashboard/TeamView";
+import UsageView from "@/pages/dashboard/UsageView";
 import ProtectedRoute from "@/components/ProtectedRoute";
 
 function AppRouter() {
@@ -32,7 +35,11 @@ function AppRouter() {
                         <Dashboard />
                     </ProtectedRoute>
                 }
-            />
+            >
+                <Route index element={<ProjectsView />} />
+                <Route path="team" element={<TeamView />} />
+                <Route path="usage" element={<UsageView />} />
+            </Route>
         </Routes>
     );
 }
