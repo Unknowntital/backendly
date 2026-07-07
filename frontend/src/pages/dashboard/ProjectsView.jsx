@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
-import { useOutletContext } from "react-router-dom";
+import { useOutletContext, Link } from "react-router-dom";
 import axios from "axios";
 import { motion } from "framer-motion";
 import { toast } from "sonner";
-import { Plus, Database, Copy, Check, Trash2 } from "lucide-react";
+import { Plus, Database, Copy, Check, Trash2, ArrowUpRight } from "lucide-react";
 import { API } from "@/contexts/AuthContext";
 
 const REGIONS = ["us-east-1", "us-west-2", "eu-west-1", "eu-central-1", "ap-south-1", "ap-southeast-1"];
@@ -60,7 +60,8 @@ function NewProjectModal({ open, onClose, onCreated }) {
 
 function ProjectCard({ p, onDelete }) {
     const [copied, setCopied] = useState(false);
-    const copy = async () => {
+    const copy = async (e) => {
+        e.preventDefault(); e.stopPropagation();
         await navigator.clipboard.writeText(p.project_id);
         setCopied(true);
         setTimeout(() => setCopied(false), 1200);
@@ -69,38 +70,41 @@ function ProjectCard({ p, onDelete }) {
         <motion.div
             initial={{ opacity: 0, y: 12 }}
             animate={{ opacity: 1, y: 0 }}
-            className="group rounded-xl bg-white/[0.03] backdrop-blur-xl border border-white/[0.08] p-5 hover:bg-white/[0.06] hover:border-teal-400/30 transition-all"
+            className="group relative rounded-xl bg-white/[0.03] backdrop-blur-xl border border-white/[0.08] hover:bg-white/[0.06] hover:border-teal-400/30 transition-all"
             data-testid={`project-card-${p.project_id}`}
         >
-            <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                        <div className="h-8 w-8 rounded-md bg-teal-400/10 border border-teal-400/30 text-teal-300 flex items-center justify-center">
-                            <Database className="w-4 h-4" />
+            <Link to={`/dashboard/projects/${p.project_id}`} className="block p-5" data-testid={`open-project-${p.project_id}`}>
+                <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                            <div className="h-8 w-8 rounded-md bg-teal-400/10 border border-teal-400/30 text-teal-300 flex items-center justify-center">
+                                <Database className="w-4 h-4" />
+                            </div>
+                            <h3 className="font-display font-semibold text-white truncate">{p.name}</h3>
                         </div>
-                        <h3 className="font-display font-semibold text-white truncate">{p.name}</h3>
+                    </div>
+                    <ArrowUpRight className="w-4 h-4 text-zinc-500 group-hover:text-teal-300 transition-colors" />
+                </div>
+                <div className="mt-4 space-y-2 text-xs text-zinc-400">
+                    <div className="flex items-center justify-between">
+                        <span className="text-zinc-500">Project ID</span>
+                        <button onClick={copy} className="font-mono text-teal-300 hover:text-teal-200 inline-flex items-center gap-1">
+                            {p.project_id} {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                        </button>
+                    </div>
+                    <div className="flex items-center justify-between">
+                        <span className="text-zinc-500">Region</span>
+                        <span className="font-mono">{p.region}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                        <span className="text-zinc-500">Status</span>
+                        <span className="inline-flex items-center gap-1.5 text-teal-300"><span className="h-1.5 w-1.5 rounded-full bg-teal-400 animate-pulse" /> Ready</span>
                     </div>
                 </div>
-                <button onClick={() => onDelete(p.project_id)} aria-label="Delete project" className="opacity-0 group-hover:opacity-100 transition-opacity h-8 w-8 rounded-md bg-white/[0.03] border border-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-red-300 hover:border-red-400/30" data-testid={`project-delete-${p.project_id}`}>
-                    <Trash2 className="w-3.5 h-3.5" />
-                </button>
-            </div>
-            <div className="mt-4 space-y-2 text-xs text-zinc-400">
-                <div className="flex items-center justify-between">
-                    <span className="text-zinc-500">Project ID</span>
-                    <button onClick={copy} className="font-mono text-teal-300 hover:text-teal-200 inline-flex items-center gap-1">
-                        {p.project_id} {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-                    </button>
-                </div>
-                <div className="flex items-center justify-between">
-                    <span className="text-zinc-500">Region</span>
-                    <span className="font-mono">{p.region}</span>
-                </div>
-                <div className="flex items-center justify-between">
-                    <span className="text-zinc-500">Status</span>
-                    <span className="inline-flex items-center gap-1.5 text-teal-300"><span className="h-1.5 w-1.5 rounded-full bg-teal-400 animate-pulse" /> Ready</span>
-                </div>
-            </div>
+            </Link>
+            <button onClick={() => onDelete(p.project_id)} aria-label="Delete project" className="absolute top-4 right-14 opacity-0 group-hover:opacity-100 transition-opacity h-8 w-8 rounded-md bg-white/[0.03] border border-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-red-300 hover:border-red-400/30 z-10" data-testid={`project-delete-${p.project_id}`}>
+                <Trash2 className="w-3.5 h-3.5" />
+            </button>
         </motion.div>
     );
 }

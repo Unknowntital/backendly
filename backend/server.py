@@ -4,9 +4,11 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
+import re
+import hashlib
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict, EmailStr
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 import uuid
 import bcrypt
 import httpx
@@ -479,6 +481,16 @@ async def list_projects(user: User = Depends(current_user)):
     return docs
 
 
+@api_router.get("/projects/{project_id}", response_model=Project)
+async def get_project(project_id: str, user: User = Depends(current_user)):
+    d = await db.projects.find_one({"project_id": project_id, "user_id": user.user_id}, {"_id": 0})
+    if not d:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    if isinstance(d.get("created_at"), str):
+        d["created_at"] = datetime.fromisoformat(d["created_at"])
+    return d
+
+
 @api_router.post("/projects", response_model=Project, status_code=201)
 async def create_project(payload: ProjectCreate, user: User = Depends(current_user)):
     project_id = f"prj_{uuid.uuid4().hex[:10]}"
@@ -574,7 +586,7 @@ async def remove_team_member(member_id: str, user: User = Depends(current_user))
     return {"ok": True}
 
 
-# ---------------- Usage ----------------
+# ---------------- Usage (real, metered) ----------------
 class UsageMetric(BaseModel):
     label: str
     value: int
@@ -589,35 +601,489 @@ class UsageResponse(BaseModel):
     metrics: List[UsageMetric]
 
 
-def _seed_series(seed: int, length: int, base: int, spread: int) -> List[int]:
-    # Deterministic pseudo-random series so users see consistent numbers
-    import random
-    rnd = random.Random(seed)
-    return [max(0, int(base + rnd.gauss(0, spread))) for _ in range(length)]
+async def _project_ids_for_user(user_id: str, project_id: Optional[str] = None) -> List[str]:
+    q = {"user_id": user_id}
+    if project_id:
+        q["project_id"] = project_id
+    docs = await db.projects.find(q, {"_id": 0, "project_id": 1}).to_list(500)
+    return [d["project_id"] for d in docs]
 
 
-@api_router.get("/usage", response_model=UsageResponse)
-async def get_usage(user: User = Depends(current_user)):
+async def _usage_for_projects(project_ids: List[str]) -> UsageResponse:
     now = datetime.now(timezone.utc)
     start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    project_count = await db.projects.count_documents({"user_id": user.user_id})
-    seed_base = sum(ord(c) for c in user.user_id) + project_count
+    api_days = [0] * 30
+    read_days = [0] * 30
+    write_days = [0] * 30
+    total_requests = 0
+    total_reads = 0
+    total_writes = 0
+    total_bandwidth_bytes = 0
 
-    api_series = _seed_series(seed_base + 1, 30, 4200, 1200)
-    db_series = _seed_series(seed_base + 2, 30, 320, 90)
-    fn_series = _seed_series(seed_base + 3, 30, 180, 60)
-    bw_series = _seed_series(seed_base + 4, 30, 45, 15)
+    if project_ids:
+        cur = db.request_logs.find(
+            {"project_id": {"$in": project_ids}, "created_at": {"$gte": start.isoformat()}},
+            {"_id": 0, "method": 1, "status": 1, "created_at": 1, "bytes": 1},
+        )
+        async for d in cur:
+            ts = d.get("created_at")
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            day = (ts - start).days
+            if 0 <= day < 30:
+                api_days[day] += 1
+                if d.get("method") in ("POST", "PATCH", "PUT", "DELETE"):
+                    write_days[day] += 1
+                    total_writes += 1
+                else:
+                    read_days[day] += 1
+                    total_reads += 1
+                total_requests += 1
+                total_bandwidth_bytes += int(d.get("bytes") or 0)
+
+    # Records currently stored (all-time)
+    row_count = 0
+    if project_ids:
+        row_count = await db.project_records.count_documents({"project_id": {"$in": project_ids}})
+
+    bandwidth_gb = total_bandwidth_bytes / (1024 * 1024 * 1024)
 
     metrics = [
-        UsageMetric(label="API requests", value=sum(api_series), limit=1_000_000, unit="req", series=api_series),
-        UsageMetric(label="Database rows read", value=sum(db_series) * 100, limit=50_000_000, unit="rows", series=db_series),
-        UsageMetric(label="Function invocations", value=sum(fn_series), limit=200_000, unit="calls", series=fn_series),
-        UsageMetric(label="Bandwidth", value=sum(bw_series), limit=2_500, unit="GB", series=bw_series),
+        UsageMetric(label="API requests", value=total_requests, limit=1_000_000, unit="req", series=api_days),
+        UsageMetric(label="Rows stored", value=row_count, limit=500_000, unit="rows", series=read_days),
+        UsageMetric(label="Write operations", value=total_writes, limit=200_000, unit="ops", series=write_days),
+        UsageMetric(label="Bandwidth", value=round(bandwidth_gb, 3), limit=100, unit="GB", series=api_days),
     ]
     return UsageResponse(period_start=start, period_end=now, metrics=metrics)
 
 
+@api_router.get("/usage", response_model=UsageResponse)
+async def get_usage(user: User = Depends(current_user)):
+    project_ids = await _project_ids_for_user(user.user_id)
+    return await _usage_for_projects(project_ids)
+
+
+@api_router.get("/projects/{project_id}/usage", response_model=UsageResponse)
+async def get_project_usage(project_id: str, user: User = Depends(current_user)):
+    ids = await _project_ids_for_user(user.user_id, project_id)
+    if not ids:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    return await _usage_for_projects(ids)
+
+
+# ==================================================================
+# Tables & API keys (dashboard) + API v1 record CRUD (external)
+# Multi-tenant isolation:
+#   Every project_tables / project_records / api_keys / request_logs
+#   document has a project_id. Every read/write MUST filter by it.
+# ==================================================================
+
+FIELD_TYPES = {"string", "integer", "float", "boolean", "datetime", "json"}
+SLUG_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+
+
+class SchemaField(BaseModel):
+    name: str
+    type: str
+    required: bool = False
+    default: Optional[Any] = None
+
+
+class TableCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    fields: List[SchemaField]
+
+
+class TableModel(BaseModel):
+    table_id: str
+    project_id: str
+    name: str
+    fields: List[SchemaField]
+    created_at: datetime
+
+
+class ApiKeyCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+
+
+class ApiKeyPublic(BaseModel):
+    key_id: str
+    project_id: str
+    name: str
+    prefix: str
+    last4: str
+    last_used_at: Optional[datetime] = None
+    created_at: datetime
+
+
+class ApiKeyCreated(ApiKeyPublic):
+    key: str  # full plaintext, returned ONCE
+
+
+async def _owned_project(project_id: str, user: User) -> Dict[str, Any]:
+    p = await db.projects.find_one({"project_id": project_id, "user_id": user.user_id}, {"_id": 0})
+    if not p:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    return p
+
+
+def _validate_slug(name: str, kind: str = "identifier") -> str:
+    n = name.strip().lower()
+    if not SLUG_RE.match(n):
+        raise HTTPException(status_code=400, detail=f"Invalid {kind}. Use lowercase letters, digits, underscores, starting with a letter (max 40 chars).")
+    return n
+
+
+def _validate_fields(fields: List[SchemaField]) -> List[SchemaField]:
+    if not fields:
+        raise HTTPException(status_code=400, detail="A table needs at least one field.")
+    seen = set()
+    out: List[SchemaField] = []
+    for f in fields:
+        n = _validate_slug(f.name, "field name")
+        if n in seen:
+            raise HTTPException(status_code=400, detail=f"Duplicate field: {n}")
+        if f.type not in FIELD_TYPES:
+            raise HTTPException(status_code=400, detail=f"Unknown field type: {f.type}")
+        seen.add(n)
+        out.append(SchemaField(name=n, type=f.type, required=f.required, default=f.default))
+    return out
+
+
+# --------- Tables (dashboard, session-authed) ---------
+@api_router.get("/projects/{project_id}/tables", response_model=List[TableModel])
+async def list_tables(project_id: str, user: User = Depends(current_user)):
+    await _owned_project(project_id, user)
+    docs = await db.project_tables.find({"project_id": project_id}, {"_id": 0}).sort("created_at", 1).to_list(200)
+    for d in docs:
+        if isinstance(d.get("created_at"), str):
+            d["created_at"] = datetime.fromisoformat(d["created_at"])
+    return docs
+
+
+@api_router.post("/projects/{project_id}/tables", response_model=TableModel, status_code=201)
+async def create_table(project_id: str, payload: TableCreate, user: User = Depends(current_user)):
+    await _owned_project(project_id, user)
+    name = _validate_slug(payload.name, "table name")
+    fields = _validate_fields(payload.fields)
+    if await db.project_tables.find_one({"project_id": project_id, "name": name}):
+        raise HTTPException(status_code=409, detail=f"A table named '{name}' already exists in this project.")
+    table_id = f"tbl_{uuid.uuid4().hex[:10]}"
+    now = datetime.now(timezone.utc)
+    doc = {
+        "table_id": table_id,
+        "project_id": project_id,
+        "name": name,
+        "fields": [f.model_dump() for f in fields],
+        "created_at": now.isoformat(),
+    }
+    await db.project_tables.insert_one(doc)
+    return TableModel(table_id=table_id, project_id=project_id, name=name, fields=fields, created_at=now)
+
+
+@api_router.delete("/projects/{project_id}/tables/{table_id}")
+async def delete_table(project_id: str, table_id: str, user: User = Depends(current_user)):
+    await _owned_project(project_id, user)
+    res = await db.project_tables.delete_one({"project_id": project_id, "table_id": table_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Table not found.")
+    # Cascade: delete all records in that table (still scoped by project_id for safety)
+    await db.project_records.delete_many({"project_id": project_id, "table_id": table_id})
+    return {"ok": True}
+
+
+# --------- API keys (dashboard) ---------
+def _mint_api_key() -> Dict[str, str]:
+    # Format: bkl_live_<32 url-safe chars>
+    secret = secrets.token_urlsafe(24).replace("_", "").replace("-", "")[:24]
+    full = f"bkl_live_{secret}"
+    key_hash = hashlib.sha256(full.encode()).hexdigest()
+    return {
+        "key": full,
+        "prefix": f"bkl_live_{secret[:4]}",
+        "last4": secret[-4:],
+        "key_hash": key_hash,
+    }
+
+
+@api_router.get("/projects/{project_id}/api-keys", response_model=List[ApiKeyPublic])
+async def list_api_keys(project_id: str, user: User = Depends(current_user)):
+    await _owned_project(project_id, user)
+    docs = await db.api_keys.find({"project_id": project_id}, {"_id": 0, "key_hash": 0}).sort("created_at", -1).to_list(200)
+    for d in docs:
+        for f in ("created_at", "last_used_at"):
+            if isinstance(d.get(f), str):
+                d[f] = datetime.fromisoformat(d[f])
+    return docs
+
+
+@api_router.post("/projects/{project_id}/api-keys", response_model=ApiKeyCreated, status_code=201)
+async def create_api_key(project_id: str, payload: ApiKeyCreate, user: User = Depends(current_user)):
+    await _owned_project(project_id, user)
+    minted = _mint_api_key()
+    key_id = f"key_{uuid.uuid4().hex[:10]}"
+    now = datetime.now(timezone.utc)
+    doc = {
+        "key_id": key_id,
+        "project_id": project_id,
+        "name": payload.name,
+        "prefix": minted["prefix"],
+        "last4": minted["last4"],
+        "key_hash": minted["key_hash"],
+        "last_used_at": None,
+        "created_at": now.isoformat(),
+    }
+    await db.api_keys.insert_one(doc)
+    return ApiKeyCreated(
+        key_id=key_id, project_id=project_id, name=payload.name,
+        prefix=minted["prefix"], last4=minted["last4"],
+        last_used_at=None, created_at=now, key=minted["key"],
+    )
+
+
+@api_router.delete("/projects/{project_id}/api-keys/{key_id}")
+async def revoke_api_key(project_id: str, key_id: str, user: User = Depends(current_user)):
+    await _owned_project(project_id, user)
+    res = await db.api_keys.delete_one({"project_id": project_id, "key_id": key_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="API key not found.")
+    return {"ok": True}
+
+
+# --------- API v1: external record CRUD (API-key authed) ---------
+api_v1 = APIRouter(prefix="/api/v1")
+
+
+async def api_key_project(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> str:
+    key = x_api_key
+    if not key and authorization and authorization.lower().startswith("bearer "):
+        key = authorization.split(" ", 1)[1].strip()
+    if not key:
+        raise HTTPException(status_code=401, detail="Missing X-API-Key header.")
+    if not key.startswith("bkl_"):
+        raise HTTPException(status_code=401, detail="Invalid API key format.")
+    key_hash = hashlib.sha256(key.encode()).hexdigest()
+    doc = await db.api_keys.find_one({"key_hash": key_hash}, {"_id": 0, "project_id": 1, "key_id": 1})
+    if not doc:
+        raise HTTPException(status_code=401, detail="Invalid API key.")
+    request.state.project_id = doc["project_id"]
+    request.state.api_key_id = doc["key_id"]
+    # fire-and-forget: update last_used_at
+    async def _touch():
+        try:
+            await db.api_keys.update_one(
+                {"key_id": doc["key_id"]},
+                {"$set": {"last_used_at": datetime.now(timezone.utc).isoformat()}},
+            )
+        except Exception:
+            pass
+    asyncio.create_task(_touch())
+    return doc["project_id"]
+
+
+def _coerce(value: Any, ftype: str) -> Any:
+    if value is None:
+        return None
+    try:
+        if ftype == "string":
+            return str(value)
+        if ftype == "integer":
+            return int(value)
+        if ftype == "float":
+            return float(value)
+        if ftype == "boolean":
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.lower() in ("true", "1", "yes")
+            return bool(value)
+        if ftype == "datetime":
+            if isinstance(value, str):
+                # accept ISO strings
+                datetime.fromisoformat(value.replace("Z", "+00:00"))
+                return value
+            return str(value)
+        if ftype == "json":
+            return value
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"Value for a {ftype} field is not valid.")
+    return value
+
+
+def _validate_payload(fields: List[Dict[str, Any]], payload: Dict[str, Any], partial: bool = False) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
+    allowed = {f["name"] for f in fields}
+    unknown = set(payload.keys()) - allowed
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown field(s): {', '.join(sorted(unknown))}")
+    out: Dict[str, Any] = {}
+    for f in fields:
+        name = f["name"]
+        if name in payload:
+            out[name] = _coerce(payload[name], f["type"])
+        elif not partial:
+            if f.get("required"):
+                if f.get("default") is not None:
+                    out[name] = _coerce(f["default"], f["type"])
+                else:
+                    raise HTTPException(status_code=400, detail=f"Missing required field: {name}")
+            elif f.get("default") is not None:
+                out[name] = _coerce(f["default"], f["type"])
+    return out
+
+
+def _envelope(doc: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": doc["record_id"],
+        "created_at": doc["created_at"],
+        "updated_at": doc["updated_at"],
+        **doc.get("data", {}),
+    }
+
+
+async def _get_table(project_id: str, table_name: str) -> Dict[str, Any]:
+    table = await db.project_tables.find_one({"project_id": project_id, "name": table_name}, {"_id": 0})
+    if not table:
+        raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found.")
+    return table
+
+
+@api_v1.get("/tables")
+async def api_v1_list_tables(project_id: str = Depends(api_key_project)):
+    docs = await db.project_tables.find({"project_id": project_id}, {"_id": 0}).sort("created_at", 1).to_list(200)
+    return [{"name": d["name"], "fields": d["fields"]} for d in docs]
+
+
+@api_v1.get("/{table_name}")
+async def api_v1_list_records(
+    table_name: str,
+    limit: int = 50,
+    offset: int = 0,
+    project_id: str = Depends(api_key_project),
+):
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    table = await _get_table(project_id, table_name)
+    q = {"project_id": project_id, "table_id": table["table_id"]}
+    total = await db.project_records.count_documents(q)
+    cur = db.project_records.find(q, {"_id": 0}).sort("created_at", -1).skip(offset).limit(limit)
+    return {
+        "data": [_envelope(d) async for d in cur],
+        "meta": {"total": total, "limit": limit, "offset": offset},
+    }
+
+
+@api_v1.post("/{table_name}", status_code=201)
+async def api_v1_create_record(
+    table_name: str,
+    payload: Dict[str, Any],
+    project_id: str = Depends(api_key_project),
+):
+    table = await _get_table(project_id, table_name)
+    data = _validate_payload(table["fields"], payload)
+    record_id = f"rec_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "record_id": record_id,
+        "project_id": project_id,
+        "table_id": table["table_id"],
+        "data": data,
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db.project_records.insert_one(doc)
+    return _envelope(doc)
+
+
+@api_v1.get("/{table_name}/{record_id}")
+async def api_v1_get_record(
+    table_name: str, record_id: str, project_id: str = Depends(api_key_project),
+):
+    table = await _get_table(project_id, table_name)
+    doc = await db.project_records.find_one(
+        {"project_id": project_id, "table_id": table["table_id"], "record_id": record_id},
+        {"_id": 0},
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Record not found.")
+    return _envelope(doc)
+
+
+@api_v1.patch("/{table_name}/{record_id}")
+async def api_v1_update_record(
+    table_name: str,
+    record_id: str,
+    payload: Dict[str, Any],
+    project_id: str = Depends(api_key_project),
+):
+    table = await _get_table(project_id, table_name)
+    data = _validate_payload(table["fields"], payload, partial=True)
+    if not data:
+        raise HTTPException(status_code=400, detail="No valid fields to update.")
+    now = datetime.now(timezone.utc).isoformat()
+    set_fields = {f"data.{k}": v for k, v in data.items()}
+    set_fields["updated_at"] = now
+    res = await db.project_records.update_one(
+        {"project_id": project_id, "table_id": table["table_id"], "record_id": record_id},
+        {"$set": set_fields},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Record not found.")
+    doc = await db.project_records.find_one(
+        {"project_id": project_id, "table_id": table["table_id"], "record_id": record_id},
+        {"_id": 0},
+    )
+    return _envelope(doc)
+
+
+@api_v1.delete("/{table_name}/{record_id}")
+async def api_v1_delete_record(
+    table_name: str, record_id: str, project_id: str = Depends(api_key_project),
+):
+    table = await _get_table(project_id, table_name)
+    res = await db.project_records.delete_one(
+        {"project_id": project_id, "table_id": table["table_id"], "record_id": record_id},
+    )
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Record not found.")
+    return {"ok": True}
+
+
 app.include_router(api_router)
+app.include_router(api_v1)
+
+
+@app.middleware("http")
+async def usage_logger(request: Request, call_next):
+    response = await call_next(request)
+    try:
+        if request.url.path.startswith("/api/v1/"):
+            project_id = getattr(request.state, "project_id", None)
+            if project_id:
+                # measure response length via header if present
+                content_length = response.headers.get("content-length")
+                bytes_est = int(content_length) if content_length and content_length.isdigit() else 0
+                await db.request_logs.insert_one({
+                    "id": str(uuid.uuid4()),
+                    "project_id": project_id,
+                    "api_key_id": getattr(request.state, "api_key_id", None),
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": response.status_code,
+                    "bytes": bytes_est,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                })
+    except Exception as e:
+        logger.error(f"usage_logger failed: {e}")
+    return response
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -632,6 +1098,21 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+@app.on_event("startup")
+async def create_indexes():
+    try:
+        await db.api_keys.create_index("key_hash", unique=True)
+        await db.api_keys.create_index([("project_id", 1), ("created_at", -1)])
+        await db.project_tables.create_index([("project_id", 1), ("name", 1)], unique=True)
+        await db.project_records.create_index([("project_id", 1), ("table_id", 1), ("created_at", -1)])
+        await db.project_records.create_index([("project_id", 1), ("record_id", 1)])
+        await db.request_logs.create_index([("project_id", 1), ("created_at", -1)])
+        # Auto-expire request logs after 40 days
+        await db.request_logs.create_index("created_at", expireAfterSeconds=60 * 60 * 24 * 40)
+    except Exception as e:
+        logger.error(f"Index creation error: {e}")
 
 
 @app.on_event("shutdown")

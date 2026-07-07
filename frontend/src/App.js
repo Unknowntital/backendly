@@ -12,6 +12,7 @@ import ForgotPassword from "@/pages/ForgotPassword";
 import ResetPassword from "@/pages/ResetPassword";
 import Dashboard from "@/pages/Dashboard";
 import ProjectsView from "@/pages/dashboard/ProjectsView";
+import ProjectDetail from "@/pages/dashboard/ProjectDetail";
 import TeamView from "@/pages/dashboard/TeamView";
 import UsageView from "@/pages/dashboard/UsageView";
 import ProtectedRoute from "@/components/ProtectedRoute";
@@ -41,6 +42,7 @@ function AppRouter() {
                 }
             >
                 <Route index element={<ProjectsView />} />
+                <Route path="projects/:projectId" element={<ProjectDetail />} />
                 <Route path="team" element={<TeamView />} />
                 <Route path="usage" element={<UsageView />} />
             </Route>
