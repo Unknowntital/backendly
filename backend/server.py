@@ -11,6 +11,10 @@ import uuid
 import bcrypt
 import httpx
 import secrets
+import smtplib
+import asyncio
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone, timedelta
 
 
@@ -26,6 +30,7 @@ api_router = APIRouter(prefix="/api")
 
 SESSION_DAYS = 7
 COOKIE_NAME = "session_token"
+RESET_TOKEN_MINUTES = 30
 
 
 # ---------------- Models ----------------
@@ -93,6 +98,15 @@ class GoogleSessionPayload(BaseModel):
     session_id: str
 
 
+class ForgotPasswordPayload(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordPayload(BaseModel):
+    token: str = Field(min_length=16, max_length=200)
+    password: str = Field(min_length=8, max_length=128)
+
+
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=60)
     region: Optional[str] = Field(default="us-east-1", max_length=32)
@@ -123,6 +137,24 @@ class TeamMember(BaseModel):
 # ---------------- Auth helpers ----------------
 def _mint_session_token() -> str:
     return secrets.token_urlsafe(48)
+
+
+def _send_email_sync(to_email: str, subject: str, html: str, text: str) -> None:
+    gmail_user = os.environ["GMAIL_USER"]
+    gmail_pw = os.environ["GMAIL_APP_PASSWORD"].replace(" ", "")
+    msg = MIMEMultipart("alternative")
+    msg["From"] = f"Backendly <{gmail_user}>"
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(text, "plain"))
+    msg.attach(MIMEText(html, "html"))
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
+        smtp.login(gmail_user, gmail_pw)
+        smtp.sendmail(gmail_user, [to_email], msg.as_string())
+
+
+async def send_email(to_email: str, subject: str, html: str, text: str) -> None:
+    await asyncio.to_thread(_send_email_sync, to_email, subject, html, text)
 
 
 async def _create_session(user_id: str) -> str:
@@ -334,6 +366,107 @@ async def logout(response: Response, session_token: Optional[str] = Cookie(defau
         await db.user_sessions.delete_one({"session_token": session_token})
     response.delete_cookie(COOKIE_NAME, path="/", samesite="none", secure=True)
     return {"ok": True}
+
+
+# ---------------- Password reset ----------------
+def _reset_email_html(name: str, reset_url: str) -> str:
+    return f"""
+<!doctype html>
+<html>
+<body style="margin:0;background:#08090C;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+  <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background:#08090C;padding:40px 12px;">
+    <tr><td align="center">
+      <table role="presentation" cellpadding="0" cellspacing="0" width="480" style="background:#0A0C10;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:32px;">
+        <tr><td>
+          <div style="font-family:'JetBrains Mono',monospace;color:#2DD4BF;font-weight:700;font-size:18px;">{{}} Backendly</div>
+          <h1 style="color:#ffffff;font-size:24px;margin:24px 0 8px 0;letter-spacing:-0.02em;">Reset your password</h1>
+          <p style="color:#a1a1aa;font-size:15px;line-height:1.6;margin:0 0 24px 0;">Hi {name}, we received a request to reset the password on your Backendly account. Click the button below to choose a new one. The link is good for 30 minutes.</p>
+          <a href="{reset_url}" style="display:inline-block;background:#F59E0B;color:#000;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:600;font-size:14px;">Reset password</a>
+          <p style="color:#71717a;font-size:13px;line-height:1.6;margin:32px 0 0 0;">Or copy this URL into your browser:<br><span style="color:#2DD4BF;word-break:break-all;">{reset_url}</span></p>
+          <hr style="border:none;border-top:1px solid rgba(255,255,255,0.06);margin:32px 0;">
+          <p style="color:#52525b;font-size:12px;line-height:1.6;margin:0;">Didn't ask for this? You can safely ignore this email — the link will expire on its own.</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+
+def _reset_email_text(name: str, reset_url: str) -> str:
+    return (
+        f"Hi {name},\n\n"
+        f"We received a request to reset the password on your Backendly account. "
+        f"Open this link within the next 30 minutes to choose a new password:\n\n"
+        f"{reset_url}\n\n"
+        f"Didn't ask for this? You can safely ignore this email.\n\n— Backendly"
+    )
+
+
+@api_router.post("/auth/forgot-password")
+async def forgot_password(payload: ForgotPasswordPayload):
+    # Always respond OK to avoid leaking whether the email exists
+    user = await db.users.find_one({"email": payload.email}, {"_id": 0})
+    if user:
+        token = secrets.token_urlsafe(32)
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=RESET_TOKEN_MINUTES)
+        await db.password_resets.insert_one({
+            "reset_token": token,
+            "user_id": user["user_id"],
+            "email": user["email"],
+            "expires_at": expires_at.isoformat(),
+            "used": False,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        reset_url = f"{os.environ['FRONTEND_URL'].rstrip('/')}/reset-password?token={token}"
+        try:
+            await send_email(
+                to_email=user["email"],
+                subject="Reset your Backendly password",
+                html=_reset_email_html(user.get("name") or "there", reset_url),
+                text=_reset_email_text(user.get("name") or "there", reset_url),
+            )
+        except Exception as e:
+            logger.error(f"Failed to send reset email: {e}")
+            # Still return 200 so we don't leak errors that hint the email exists
+    return {"ok": True, "message": "If an account exists for that email, a reset link has been sent."}
+
+
+@api_router.post("/auth/reset-password", response_model=User)
+async def reset_password(payload: ResetPasswordPayload, response: Response):
+    doc = await db.password_resets.find_one({"reset_token": payload.token}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset link.")
+    if doc.get("used"):
+        raise HTTPException(status_code=400, detail="This reset link has already been used.")
+    expires_at = doc["expires_at"]
+    if isinstance(expires_at, str):
+        expires_at = datetime.fromisoformat(expires_at)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="This reset link has expired. Request a new one.")
+
+    user_doc = await db.users.find_one({"user_id": doc["user_id"]}, {"_id": 0})
+    if not user_doc:
+        raise HTTPException(status_code=400, detail="Invalid reset link.")
+
+    new_hash = bcrypt.hashpw(payload.password.encode(), bcrypt.gensalt()).decode()
+    await db.users.update_one({"user_id": doc["user_id"]}, {"$set": {"password_hash": new_hash}})
+    await db.password_resets.update_one({"reset_token": payload.token}, {"$set": {"used": True}})
+    # Invalidate all existing sessions for this user for safety
+    await db.user_sessions.delete_many({"user_id": doc["user_id"]})
+
+    # Log the user in with a fresh session
+    token = await _create_session(doc["user_id"])
+    _set_session_cookie(response, token)
+    return User(
+        user_id=user_doc["user_id"],
+        email=user_doc["email"],
+        name=user_doc["name"],
+        picture=user_doc.get("picture"),
+        auth_provider=user_doc.get("auth_provider", "password"),
+    )
 
 
 # ---------------- Projects (dashboard) ----------------

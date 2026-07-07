@@ -148,7 +148,13 @@ export default function AuthPage({ mode = "login" }) {
                             {isSignup ? (
                                 <>Already have an account? <Link to="/login" className="text-teal-300 hover:text-teal-200 font-medium" data-testid="auth-switch-login">Sign in</Link></>
                             ) : (
-                                <>New to Backendly? <Link to="/signup" className="text-teal-300 hover:text-teal-200 font-medium" data-testid="auth-switch-signup">Create an account</Link></>
+                                <>
+                                    New to Backendly? <Link to="/signup" className="text-teal-300 hover:text-teal-200 font-medium" data-testid="auth-switch-signup">Create an account</Link>
+                                    <br />
+                                    <Link to="/forgot-password" className="text-zinc-400 hover:text-teal-200 text-xs mt-2 inline-block" data-testid="auth-forgot-link">
+                                        Forgot your password?
+                                    </Link>
+                                </>
                             )}
                         </p>
                     </div>

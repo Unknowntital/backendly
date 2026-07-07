@@ -8,6 +8,8 @@ import Contact from "@/pages/Contact";
 import Docs from "@/pages/Docs";
 import AuthPage from "@/pages/AuthPage";
 import AuthCallback from "@/pages/AuthCallback";
+import ForgotPassword from "@/pages/ForgotPassword";
+import ResetPassword from "@/pages/ResetPassword";
 import Dashboard from "@/pages/Dashboard";
 import ProjectsView from "@/pages/dashboard/ProjectsView";
 import TeamView from "@/pages/dashboard/TeamView";
@@ -28,6 +30,8 @@ function AppRouter() {
             <Route path="/docs" element={<Docs />} />
             <Route path="/login" element={<AuthPage mode="login" />} />
             <Route path="/signup" element={<AuthPage mode="signup" />} />
+            <Route path="/forgot-password" element={<ForgotPassword />} />
+            <Route path="/reset-password" element={<ResetPassword />} />
             <Route
                 path="/dashboard"
                 element={
