@@ -64,15 +64,22 @@ app.add_middleware(SlowAPIMiddleware)
 @app.middleware("http")
 async def init_db_middleware(request: Request, call_next):
     global db, pool, db_lock
-    if db is None:
-        if db_lock is None:
-            db_lock = asyncio.Lock()
-        async with db_lock:
-            if db is None:
-                pg_url = os.environ.get('DATABASE_URL', 'postgresql://postgres:backendly2026@localhost:3000/postgres')
-                pool = await asyncpg.create_pool(pg_url)
-                db = Database(pool)
-    return await call_next(request)
+    try:
+        if db is None:
+            if db_lock is None:
+                db_lock = asyncio.Lock()
+            async with db_lock:
+                if db is None:
+                    pg_url = os.environ.get('DATABASE_URL')
+                    if not pg_url:
+                        raise ValueError("DATABASE_URL is missing from environment variables")
+                    pool = await asyncpg.create_pool(pg_url)
+                    db = Database(pool)
+        return await call_next(request)
+    except Exception as e:
+        import traceback
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=500, content={"error": str(e), "trace": traceback.format_exc()})
 
 api_router = APIRouter(prefix="/api")
 
