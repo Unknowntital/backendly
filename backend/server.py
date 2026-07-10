@@ -41,12 +41,14 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
-db_lock = asyncio.Lock()
+db_lock = None
 
 @app.middleware("http")
 async def init_db_middleware(request: Request, call_next):
-    global db, pool
+    global db, pool, db_lock
     if db is None:
+        if db_lock is None:
+            db_lock = asyncio.Lock()
         async with db_lock:
             if db is None:
                 pg_url = os.environ.get('DATABASE_URL', 'postgresql://postgres:backendly2026@localhost:3000/postgres')
