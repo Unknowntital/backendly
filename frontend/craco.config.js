@@ -84,6 +84,15 @@ let webpackConfig = {
       '@': path.resolve(__dirname, 'src'),
     },
     configure: (webpackConfig) => {
+      // Remove ModuleScopePlugin to allow importing from outside src/ (like our local SDK)
+      if (webpackConfig.resolve && webpackConfig.resolve.plugins) {
+        const scopePluginIndex = webpackConfig.resolve.plugins.findIndex(
+          (plugin) => plugin.constructor && plugin.constructor.name === 'ModuleScopePlugin'
+        );
+        if (scopePluginIndex > -1) {
+          webpackConfig.resolve.plugins.splice(scopePluginIndex, 1);
+        }
+      }
 
       // Add ignored patterns to reduce watched directories
         webpackConfig.watchOptions = {
