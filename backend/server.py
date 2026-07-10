@@ -41,6 +41,19 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
+db_lock = asyncio.Lock()
+
+@app.middleware("http")
+async def init_db_middleware(request: Request, call_next):
+    global db, pool
+    if db is None:
+        async with db_lock:
+            if db is None:
+                pg_url = os.environ.get('DATABASE_URL', 'postgresql://postgres:backendly2026@localhost:3000/postgres')
+                pool = await asyncpg.create_pool(pg_url)
+                db = Database(pool)
+    return await call_next(request)
+
 def get_limiter_key(request: Request):
     if hasattr(request.state, "end_user_id") and request.state.end_user_id:
         return f"eu_{request.state.end_user_id}"
