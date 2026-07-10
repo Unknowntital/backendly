@@ -9,3 +9,4 @@ slowapi
 redis
 httpx
 bcrypt
+email-validator
