@@ -16,6 +16,7 @@ import ProjectDetail from "@/pages/dashboard/ProjectDetail";
 import TeamView from "@/pages/dashboard/TeamView";
 import UsageView from "@/pages/dashboard/UsageView";
 import ProtectedRoute from "@/components/ProtectedRoute";
+import ErrorBoundary from "@/components/ErrorBoundary";
 
 function AppRouter() {
     const location = useLocation();
@@ -54,9 +55,11 @@ function App() {
     return (
         <div className="App min-h-screen bg-[#08090C] text-white antialiased">
             <BrowserRouter>
+                <ErrorBoundary>
                 <AuthProvider>
                     <AppRouter />
                 </AuthProvider>
+                </ErrorBoundary>
             </BrowserRouter>
             <Toaster
                 theme="dark"

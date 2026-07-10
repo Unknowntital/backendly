@@ -8,9 +8,10 @@ import {
     BarChart3, Eye, EyeOff, Code, AlertTriangle, X
 } from "lucide-react";
 import { API } from "@/contexts/AuthContext";
+import RealtimeTab from "../../components/sections/RealtimeTab";
 
 const FIELD_TYPES = ["string", "integer", "float", "boolean", "datetime", "json"];
-const TABS = ["Tables", "API Keys", "Usage", "API"];
+const TABS = ["Tables", "Realtime", "API Keys", "Usage", "API"];
 
 function Tabs({ active, onChange }) {
     return (
@@ -480,6 +481,7 @@ export default function ProjectDetail() {
 
             <main className="flex-1 px-6 md:px-8 py-8">
                 {tab === "Tables" && <TablesTab project={project} tables={tables} onReload={load} />}
+                {tab === "Realtime" && <RealtimeTab project={project} />}
                 {tab === "API Keys" && <ApiKeysTab project={project} />}
                 {tab === "Usage" && <ProjectUsageTab project={project} />}
                 {tab === "API" && <ApiTab project={project} tables={tables} />}

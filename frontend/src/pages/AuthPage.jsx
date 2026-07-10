@@ -9,7 +9,7 @@ import { useAuth } from "@/contexts/AuthContext";
 // REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
 function googleLogin() {
     const redirectUrl = window.location.origin + "/dashboard";
-    window.location.href = `https://auth.emergentagent.com/?redirect=${encodeURIComponent(redirectUrl)}`;
+    window.location.href = `http://localhost:8000/api/auth/google/login?redirect=${encodeURIComponent(redirectUrl)}`;
 }
 
 export default function AuthPage({ mode = "login" }) {

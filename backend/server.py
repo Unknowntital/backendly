@@ -1,38 +1,70 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, Cookie, Header
+from fastapi.responses import RedirectResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
+import asyncpg
+from pg_motor_adapter import Database
 import os
 import logging
 import re
 import hashlib
-from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict, EmailStr
-from typing import List, Optional, Any, Dict
 import uuid
 import bcrypt
 import httpx
 import secrets
 import smtplib
 import asyncio
+import urllib.parse
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from pydantic import BaseModel, Field, ConfigDict, EmailStr
+from typing import List, Optional, Any, Dict
+
+# Configure logging early so it's available everywhere
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+db = None
+pool = None
+
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+
+def get_limiter_key(request: Request):
+    if hasattr(request.state, "end_user_id") and request.state.end_user_id:
+        return f"eu_{request.state.end_user_id}"
+    if hasattr(request.state, "api_key_id") and request.state.api_key_id:
+        return f"ak_{request.state.api_key_id}"
+    return get_remote_address(request)
+
+redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
+limiter = Limiter(key_func=get_limiter_key, storage_uri=redis_url)
 
 app = FastAPI(title="Backendly API")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
 api_router = APIRouter(prefix="/api")
 
 SESSION_DAYS = 7
 COOKIE_NAME = "session_token"
 RESET_TOKEN_MINUTES = 30
+
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:8000/api/auth/google/callback")
 
 
 # ---------------- Models ----------------
@@ -172,13 +204,16 @@ async def _create_session(user_id: str) -> str:
 
 
 def _set_session_cookie(response: Response, token: str) -> None:
+    # Use secure=False and samesite=lax for localhost dev (no HTTPS)
+    # In production behind HTTPS, set secure=True and samesite=none
+    is_prod = os.environ.get("ENVIRONMENT", "development") == "production"
     response.set_cookie(
         key=COOKIE_NAME,
         value=token,
         max_age=SESSION_DAYS * 24 * 3600,
         httponly=True,
-        secure=True,
-        samesite="none",
+        secure=is_prod,
+        samesite="none" if is_prod else "lax",
         path="/",
     )
 
@@ -311,50 +346,124 @@ async def login(payload: LoginPayload, response: Response):
     )
 
 
-# ---------------- Auth: Emergent Google ----------------
-# REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
-@api_router.post("/auth/session", response_model=User)
-async def emergent_session(payload: GoogleSessionPayload, response: Response):
-    async with httpx.AsyncClient(timeout=15) as http:
-        r = await http.get(
-            "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
-            headers={"X-Session-ID": payload.session_id},
-        )
-    if r.status_code != 200:
-        raise HTTPException(status_code=401, detail="Invalid Google session.")
-    data = r.json()
-    email = data["email"]
-    name = data.get("name") or email.split("@")[0]
-    picture = data.get("picture")
-    session_token = data["session_token"]
+# ---------------- Auth: Google ----------------
+@app.get("/api/auth/google/login")
+async def google_login(redirect: str = "/dashboard"):
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="Google Client ID not configured")
+    
+    auth_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth?"
+        "response_type=code&"
+        f"client_id={GOOGLE_CLIENT_ID}&"
+        f"redirect_uri={urllib.parse.quote(GOOGLE_REDIRECT_URI)}&"
+        "scope=openid%20email%20profile&"
+        f"state={urllib.parse.quote(redirect)}&"
+        "access_type=offline&"
+        "prompt=consent"
+    )
+    return RedirectResponse(auth_url)
 
-    existing = await db.users.find_one({"email": email}, {"_id": 0})
+@app.get("/api/auth/google/callback")
+async def google_callback(code: str, state: str = "/dashboard"):
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise HTTPException(status_code=500, detail="Google Credentials not configured")
+    
+    async with httpx.AsyncClient() as client:
+        token_res = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": GOOGLE_REDIRECT_URI
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        
+        if token_res.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to exchange token with Google")
+            
+        token_data = token_res.json()
+        access_token = token_data.get("access_token")
+        
+        user_res = await client.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+        
+        if user_res.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to fetch user info from Google")
+            
+        user_info = user_res.json()
+        
+    email = user_info.get("email")
+    name = user_info.get("name", email.split('@')[0])
+    picture = user_info.get("picture", "")
+    
+    existing = await db.users.find_one({"email": email})
+    
     if existing:
         user_id = existing["user_id"]
         await db.users.update_one(
             {"user_id": user_id},
-            {"$set": {"name": name, "picture": picture}},
+            {"$set": {"name": name, "picture": picture}}
         )
     else:
-        user_id = f"user_{uuid.uuid4().hex[:12]}"
+        user_id = str(uuid.uuid4())
         await db.users.insert_one({
             "user_id": user_id,
             "email": email,
             "name": name,
             "picture": picture,
             "auth_provider": "google",
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "password_hash": ""
         })
-
-    expires_at = (datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)).isoformat()
+        
+    session_token = str(uuid.uuid4())
+    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     await db.user_sessions.insert_one({
-        "user_id": user_id,
         "session_token": session_token,
-        "expires_at": expires_at,
+        "user_id": user_id,
+        "expires_at": expires_at.isoformat(),
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
-    _set_session_cookie(response, session_token)
-    return User(user_id=user_id, email=email, name=name, picture=picture, auth_provider="google")
+    
+    # Redirect back to frontend with the session_token in the hash so AuthCallback can pick it up
+    frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3001")
+    if state.startswith("http"):
+        final_url = f"{state}#session_id={session_token}"
+    else:
+        redirect_url = state if state.startswith("/") else f"/{state}"
+        final_url = f"{frontend_url}{redirect_url}#session_id={session_token}"
+    return RedirectResponse(final_url)
+
+
+class SessionRequest(BaseModel):
+    session_id: str
+
+@api_router.post("/auth/session", response_model=User)
+async def validate_session(req: SessionRequest, response: Response):
+    session = await db.user_sessions.find_one({"session_token": req.session_id})
+    
+    # Need to handle timezone-aware vs naive depending on how it's stored in asyncpg JSONB
+    # Usually it's stored as string if JSONB, so let's check format
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid session")
+        
+    user = await db.users.find_one({"user_id": session["user_id"]})
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+        
+    _set_session_cookie(response, req.session_id)
+    return User(
+        user_id=user["user_id"],
+        email=user["email"],
+        name=user["name"],
+        picture=user.get("picture"),
+        auth_provider=user.get("auth_provider", "google")
+    )
 
 
 @api_router.get("/auth/me", response_model=User)
@@ -511,6 +620,17 @@ async def delete_project(project_id: str, user: User = Depends(current_user)):
     res = await db.projects.delete_one({"project_id": project_id, "user_id": user.user_id})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Project not found.")
+    # Cascade delete: clean up all related data
+    try:
+        await db.project_tables.delete_many({"project_id": project_id})
+        await db.project_records.delete_many({"project_id": project_id})
+        await db.api_keys.delete_many({"project_id": project_id})
+        await db.end_users.delete_many({"project_id": project_id})
+        await db.end_user_sessions.delete_many({"project_id": project_id})
+        await db.request_logs.delete_many({"project_id": project_id})
+        await db.team_invites.delete_many({"owner_id": user.user_id})
+    except Exception as e:
+        logger.error(f"Cascade delete failed for project {project_id}: {e}")
     return {"ok": True}
 
 
@@ -589,7 +709,7 @@ async def remove_team_member(member_id: str, user: User = Depends(current_user))
 # ---------------- Usage (real, metered) ----------------
 class UsageMetric(BaseModel):
     label: str
-    value: int
+    value: float
     limit: Optional[int] = None
     unit: str
     series: List[int]
@@ -865,26 +985,45 @@ async def api_key_project(
     if not key and authorization and authorization.lower().startswith("bearer "):
         key = authorization.split(" ", 1)[1].strip()
     if not key:
-        raise HTTPException(status_code=401, detail="Missing X-API-Key header.")
-    if not key.startswith("bkl_"):
-        raise HTTPException(status_code=401, detail="Invalid API key format.")
-    key_hash = hashlib.sha256(key.encode()).hexdigest()
-    doc = await db.api_keys.find_one({"key_hash": key_hash}, {"_id": 0, "project_id": 1, "key_id": 1})
-    if not doc:
-        raise HTTPException(status_code=401, detail="Invalid API key.")
-    request.state.project_id = doc["project_id"]
-    request.state.api_key_id = doc["key_id"]
-    # fire-and-forget: update last_used_at
-    async def _touch():
-        try:
-            await db.api_keys.update_one(
-                {"key_id": doc["key_id"]},
-                {"$set": {"last_used_at": datetime.now(timezone.utc).isoformat()}},
-            )
-        except Exception:
-            pass
-    asyncio.create_task(_touch())
-    return doc["project_id"]
+        raise HTTPException(status_code=401, detail="Missing Authentication.")
+        
+    if key.startswith("bkl_"):
+        # Developer API Key
+        key_hash = hashlib.sha256(key.encode()).hexdigest()
+        doc = await db.api_keys.find_one({"key_hash": key_hash}, {"_id": 0, "project_id": 1, "key_id": 1})
+        if not doc:
+            raise HTTPException(status_code=401, detail="Invalid API key.")
+        request.state.project_id = doc["project_id"]
+        request.state.api_key_id = doc["key_id"]
+        request.state.end_user_id = None
+        
+        async def _touch():
+            try:
+                await db.api_keys.update_one(
+                    {"key_id": doc["key_id"]},
+                    {"$set": {"last_used_at": datetime.now(timezone.utc).isoformat()}},
+                )
+            except Exception:
+                pass
+        asyncio.create_task(_touch())
+        return doc["project_id"]
+    else:
+        # End-User Token
+        sess = await db.end_user_sessions.find_one({"token": key}, {"_id": 0})
+        if not sess:
+            raise HTTPException(status_code=401, detail="Invalid or expired user token.")
+        expires_at = sess["expires_at"]
+        if isinstance(expires_at, str):
+            expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) > expires_at:
+            raise HTTPException(status_code=401, detail="Invalid or expired user token.")
+            
+        request.state.project_id = sess["project_id"]
+        request.state.api_key_id = None
+        request.state.end_user_id = sess["end_user_id"]
+        return sess["project_id"]
 
 
 def _coerce(value: Any, ftype: str) -> Any:
@@ -956,13 +1095,16 @@ async def _get_table(project_id: str, table_name: str) -> Dict[str, Any]:
 
 
 @api_v1.get("/tables")
-async def api_v1_list_tables(project_id: str = Depends(api_key_project)):
+@limiter.limit("100/minute")
+async def api_v1_list_tables(request: Request, project_id: str = Depends(api_key_project)):
     docs = await db.project_tables.find({"project_id": project_id}, {"_id": 0}).sort("created_at", 1).to_list(200)
     return [{"name": d["name"], "fields": d["fields"]} for d in docs]
 
 
 @api_v1.get("/{table_name}")
+@limiter.limit("100/minute")
 async def api_v1_list_records(
+    request: Request,
     table_name: str,
     limit: int = 50,
     offset: int = 0,
@@ -972,6 +1114,8 @@ async def api_v1_list_records(
     offset = max(0, offset)
     table = await _get_table(project_id, table_name)
     q = {"project_id": project_id, "table_id": table["table_id"]}
+    if getattr(request.state, "end_user_id", None):
+        q["data.end_user_id"] = request.state.end_user_id
     total = await db.project_records.count_documents(q)
     cur = db.project_records.find(q, {"_id": 0}).sort("created_at", -1).skip(offset).limit(limit)
     return {
@@ -981,12 +1125,16 @@ async def api_v1_list_records(
 
 
 @api_v1.post("/{table_name}", status_code=201)
+@limiter.limit("100/minute")
 async def api_v1_create_record(
+    request: Request,
     table_name: str,
     payload: Dict[str, Any],
     project_id: str = Depends(api_key_project),
 ):
     table = await _get_table(project_id, table_name)
+    if getattr(request.state, "end_user_id", None):
+        payload["end_user_id"] = request.state.end_user_id
     data = _validate_payload(table["fields"], payload)
     record_id = f"rec_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
@@ -1003,54 +1151,60 @@ async def api_v1_create_record(
 
 
 @api_v1.get("/{table_name}/{record_id}")
+@limiter.limit("100/minute")
 async def api_v1_get_record(
-    table_name: str, record_id: str, project_id: str = Depends(api_key_project),
+    request: Request, table_name: str, record_id: str, project_id: str = Depends(api_key_project),
 ):
     table = await _get_table(project_id, table_name)
-    doc = await db.project_records.find_one(
-        {"project_id": project_id, "table_id": table["table_id"], "record_id": record_id},
-        {"_id": 0},
-    )
+    q = {"project_id": project_id, "table_id": table["table_id"], "record_id": record_id}
+    if getattr(request.state, "end_user_id", None):
+        q["data.end_user_id"] = request.state.end_user_id
+    doc = await db.project_records.find_one(q, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Record not found.")
     return _envelope(doc)
 
 
 @api_v1.patch("/{table_name}/{record_id}")
+@limiter.limit("100/minute")
 async def api_v1_update_record(
+    request: Request,
     table_name: str,
     record_id: str,
     payload: Dict[str, Any],
     project_id: str = Depends(api_key_project),
 ):
     table = await _get_table(project_id, table_name)
+    q = {"project_id": project_id, "table_id": table["table_id"], "record_id": record_id}
+    if getattr(request.state, "end_user_id", None):
+        q["data.end_user_id"] = request.state.end_user_id
+        # Prevent end-user from changing their end_user_id
+        if "end_user_id" in payload:
+            payload["end_user_id"] = request.state.end_user_id
+            
     data = _validate_payload(table["fields"], payload, partial=True)
     if not data:
         raise HTTPException(status_code=400, detail="No valid fields to update.")
     now = datetime.now(timezone.utc).isoformat()
     set_fields = {f"data.{k}": v for k, v in data.items()}
     set_fields["updated_at"] = now
-    res = await db.project_records.update_one(
-        {"project_id": project_id, "table_id": table["table_id"], "record_id": record_id},
-        {"$set": set_fields},
-    )
+    res = await db.project_records.update_one(q, {"$set": set_fields})
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Record not found.")
-    doc = await db.project_records.find_one(
-        {"project_id": project_id, "table_id": table["table_id"], "record_id": record_id},
-        {"_id": 0},
-    )
+    doc = await db.project_records.find_one(q, {"_id": 0})
     return _envelope(doc)
 
 
 @api_v1.delete("/{table_name}/{record_id}")
+@limiter.limit("100/minute")
 async def api_v1_delete_record(
-    table_name: str, record_id: str, project_id: str = Depends(api_key_project),
+    request: Request, table_name: str, record_id: str, project_id: str = Depends(api_key_project),
 ):
     table = await _get_table(project_id, table_name)
-    res = await db.project_records.delete_one(
-        {"project_id": project_id, "table_id": table["table_id"], "record_id": record_id},
-    )
+    q = {"project_id": project_id, "table_id": table["table_id"], "record_id": record_id}
+    if getattr(request.state, "end_user_id", None):
+        q["data.end_user_id"] = request.state.end_user_id
+    res = await db.project_records.delete_one(q)
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Record not found.")
     return {"ok": True}
@@ -1141,7 +1295,8 @@ async def _create_end_user_session(project_id: str, end_user_id: str) -> tuple[s
 
 
 @auth_v1.post("/signup", response_model=EndUserAuthResponse, status_code=201)
-async def end_user_signup(payload: EndUserSignup, project_id: str = Depends(api_key_project)):
+@limiter.limit("10/minute")
+async def end_user_signup(request: Request, payload: EndUserSignup, project_id: str = Depends(api_key_project)):
     existing = await db.end_users.find_one({"project_id": project_id, "email": payload.email})
     if existing:
         raise HTTPException(status_code=409, detail="An account with this email already exists.")
@@ -1163,7 +1318,8 @@ async def end_user_signup(payload: EndUserSignup, project_id: str = Depends(api_
 
 
 @auth_v1.post("/login", response_model=EndUserAuthResponse)
-async def end_user_login(payload: EndUserLogin, project_id: str = Depends(api_key_project)):
+@limiter.limit("10/minute")
+async def end_user_login(request: Request, payload: EndUserLogin, project_id: str = Depends(api_key_project)):
     doc = await db.end_users.find_one({"project_id": project_id, "email": payload.email}, {"_id": 0})
     if not doc or not bcrypt.checkpw(payload.password.encode(), doc["password_hash"].encode()):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
@@ -1172,18 +1328,21 @@ async def end_user_login(payload: EndUserLogin, project_id: str = Depends(api_ke
 
 
 @auth_v1.get("/me", response_model=EndUserPublic)
-async def end_user_me(ctx: Dict[str, Any] = Depends(_end_user_token_project)):
+@limiter.limit("100/minute")
+async def end_user_me(request: Request, ctx: Dict[str, Any] = Depends(_end_user_token_project)):
     return _end_user_envelope(ctx["end_user"])
 
 
 @auth_v1.post("/logout")
-async def end_user_logout(ctx: Dict[str, Any] = Depends(_end_user_token_project)):
+@limiter.limit("100/minute")
+async def end_user_logout(request: Request, ctx: Dict[str, Any] = Depends(_end_user_token_project)):
     await db.end_user_sessions.delete_one({"token": ctx["token"]})
     return {"ok": True}
 
 
 app.include_router(auth_v1)
 app.include_router(api_v1)
+app.include_router(api_router)
 
 @api_router.get("/projects/{project_id}/end-users", response_model=List[EndUserPublic])
 async def list_end_users(project_id: str, user: User = Depends(current_user)):
@@ -1271,7 +1430,7 @@ async def usage_logger(request: Request, call_next):
                     "path": request.url.path,
                     "status": response.status_code,
                     "bytes": bytes_est,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "created_at": datetime.now(timezone.utc),
                 })
     except Exception as e:
         logger.error(f"usage_logger failed: {e}")
@@ -1286,31 +1445,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# logging is configured at the top of the file
 
 
 @app.on_event("startup")
 async def create_indexes():
+    global pool, db
     try:
-        await db.api_keys.create_index("key_hash", unique=True)
-        await db.api_keys.create_index([("project_id", 1), ("created_at", -1)])
-        await db.project_tables.create_index([("project_id", 1), ("name", 1)], unique=True)
-        await db.project_records.create_index([("project_id", 1), ("table_id", 1), ("created_at", -1)])
-        await db.project_records.create_index([("project_id", 1), ("record_id", 1)])
-        await db.request_logs.create_index([("project_id", 1), ("created_at", -1)])
-        # Auto-expire request logs after 40 days
-        await db.request_logs.create_index("created_at", expireAfterSeconds=60 * 60 * 24 * 40)
-        await db.end_users.create_index([("project_id", 1), ("email", 1)], unique=True)
-        await db.end_user_sessions.create_index("token", unique=True)
-        await db.end_user_sessions.create_index([("project_id", 1), ("end_user_id", 1)])
+        pg_url = os.environ.get('DATABASE_URL', 'postgresql://postgres:backendly2026@localhost:3000/postgres')
+        pool = await asyncpg.create_pool(pg_url)
+        db = Database(pool)
+        
+        schema_path = ROOT_DIR / "schema.sql"
+        if schema_path.exists():
+            with open(schema_path, "r") as f:
+                await pool.execute(f.read())
     except Exception as e:
-        logger.error(f"Index creation error: {e}")
+        logger.error(f"Postgres init error: {e}")
+
 
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    if pool:
+        await pool.close()

@@ -1,0 +1,75 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: backendly2026
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    command: ["postgres", "-c", "wal_level=logical"]
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:backendly2026@postgres:5432/postgres
+      - REDIS_URL=redis://redis:6379
+      - CORS_ORIGINS=http://localhost:3001,http://127.0.0.1:3001,http://localhost
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  realtime-gateway:
+    build:
+      context: ./realtime-gateway
+    ports:
+      - "3003:3003"
+    environment:
+      - DATABASE_URL=postgresql://postgres:backendly2026@postgres:5432/postgres
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  wal-listener:
+    build:
+      context: ./wal-listener
+    environment:
+      - DATABASE_URL=postgresql://postgres:backendly2026@postgres:5432/postgres
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "3001:80"
+    depends_on:
+      - backend
+      - realtime-gateway
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
