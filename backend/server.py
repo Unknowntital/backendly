@@ -48,8 +48,11 @@ def get_limiter_key(request: Request):
         return f"ak_{request.state.api_key_id}"
     return get_remote_address(request)
 
-redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
-limiter = Limiter(key_func=get_limiter_key, storage_uri=redis_url)
+redis_url = os.environ.get("REDIS_URL")
+if redis_url:
+    limiter = Limiter(key_func=get_limiter_key, storage_uri=redis_url)
+else:
+    limiter = Limiter(key_func=get_limiter_key)
 
 app = FastAPI(title="Backendly API")
 app.state.limiter = limiter
