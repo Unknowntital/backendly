@@ -43,19 +43,6 @@ from slowapi.middleware import SlowAPIMiddleware
 
 db_lock = None
 
-@app.middleware("http")
-async def init_db_middleware(request: Request, call_next):
-    global db, pool, db_lock
-    if db is None:
-        if db_lock is None:
-            db_lock = asyncio.Lock()
-        async with db_lock:
-            if db is None:
-                pg_url = os.environ.get('DATABASE_URL', 'postgresql://postgres:backendly2026@localhost:3000/postgres')
-                pool = await asyncpg.create_pool(pg_url)
-                db = Database(pool)
-    return await call_next(request)
-
 def get_limiter_key(request: Request):
     if hasattr(request.state, "end_user_id") and request.state.end_user_id:
         return f"eu_{request.state.end_user_id}"
@@ -73,6 +60,19 @@ app = FastAPI(title="Backendly API")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
+
+@app.middleware("http")
+async def init_db_middleware(request: Request, call_next):
+    global db, pool, db_lock
+    if db is None:
+        if db_lock is None:
+            db_lock = asyncio.Lock()
+        async with db_lock:
+            if db is None:
+                pg_url = os.environ.get('DATABASE_URL', 'postgresql://postgres:backendly2026@localhost:3000/postgres')
+                pool = await asyncpg.create_pool(pg_url)
+                db = Database(pool)
+    return await call_next(request)
 
 api_router = APIRouter(prefix="/api")
 
