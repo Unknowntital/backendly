@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/exhaustive-deps */
 import { useEffect, useMemo, useState } from "react";
 import { useOutletContext, useParams, useNavigate, Link } from "react-router-dom";
 import axios from "axios";
